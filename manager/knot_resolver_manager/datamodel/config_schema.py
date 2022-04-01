@@ -22,8 +22,7 @@ from knot_resolver_manager.datamodel.rpz_schema import RPZSchema
 from knot_resolver_manager.datamodel.static_hints_schema import StaticHintsSchema
 from knot_resolver_manager.datamodel.stub_zone_schema import StubZoneSchema
 from knot_resolver_manager.datamodel.supervisor_schema import SupervisorSchema
-from knot_resolver_manager.datamodel.types import DomainName
-from knot_resolver_manager.datamodel.types.types import IDPattern, IntPositive, UncheckedPath
+from knot_resolver_manager.datamodel.types import DomainName, IDPattern, IntPositive, UncheckedPath
 from knot_resolver_manager.datamodel.view_schema import ViewSchema
 from knot_resolver_manager.datamodel.webmgmt_schema import WebmgmtSchema
 from knot_resolver_manager.exceptions import DataException
@@ -120,9 +119,9 @@ class KresConfig(SchemaNode):
         options: OptionsSchema = OptionsSchema()
         network: NetworkSchema = NetworkSchema()
         static_hints: StaticHintsSchema = StaticHintsSchema()
-        views: Optional[Dict[str, ViewSchema]] = None
-        policy: Optional[Dict[str, PolicySchema]] = None
-        rpz: Optional[Dict[str, RPZSchema]] = None
+        views: Optional[Dict[IDPattern, ViewSchema]] = None
+        policy: Optional[Dict[IDPattern, PolicySchema]] = None
+        rpz: Optional[Dict[IDPattern, RPZSchema]] = None
         stub_zones: Optional[Dict[DomainName, StubZoneSchema]] = None
         forward_zones: Optional[Dict[DomainName, ForwardZoneSchema]] = None
         cache: CacheSchema = CacheSchema()
@@ -145,9 +144,9 @@ class KresConfig(SchemaNode):
     options: OptionsSchema
     network: NetworkSchema
     static_hints: StaticHintsSchema
-    views: Optional[Dict[str, ViewSchema]]
-    policy: Optional[Dict[str, PolicySchema]]
-    rpz: Optional[Dict[str, RPZSchema]]
+    views: Optional[Dict[IDPattern, ViewSchema]]
+    policy: Optional[Dict[IDPattern, PolicySchema]]
+    rpz: Optional[Dict[IDPattern, RPZSchema]]
     stub_zones: Optional[Dict[DomainName, StubZoneSchema]]
     forward_zones: Optional[Dict[DomainName, ForwardZoneSchema]]
     cache: CacheSchema
