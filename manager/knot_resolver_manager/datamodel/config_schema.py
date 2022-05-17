@@ -25,7 +25,6 @@ from knot_resolver_manager.datamodel.supervisor_schema import SupervisorSchema
 from knot_resolver_manager.datamodel.types import DomainName, IDPattern, IntPositive, UncheckedPath
 from knot_resolver_manager.datamodel.view_schema import ViewSchema
 from knot_resolver_manager.datamodel.webmgmt_schema import WebmgmtSchema
-from knot_resolver_manager.exceptions import DataException
 from knot_resolver_manager.utils import SchemaNode
 
 logger = logging.getLogger(__name__)
@@ -60,7 +59,7 @@ def _import_lua_template() -> Template:
 _MAIN_TEMPLATE = _import_lua_template()
 
 
-def _cpu_count() -> int:
+def _cpu_count() -> Optional[int]:
     try:
         return len(os.sched_getaffinity(0))
     except (NotImplementedError, AttributeError):
@@ -69,12 +68,8 @@ def _cpu_count() -> int:
             "Attempting to get the number of system CPUs using 'os.cpu_count()'"
         )
         cpus = os.cpu_count()
-        if cpus is None:
-            raise DataException(
-                "The number of available CPUs to automatically set the number of running"
-                "'kresd' workers could not be determined."
-                "The number can be specified manually in 'server:instances' configuration option."
-            )
+        if not cpus:
+            logger.warning("The number of usable CPUs could not be determined even using 'os.cpu_count()'.")
         return cpus
 
 
@@ -163,7 +158,13 @@ class KresConfig(SchemaNode):
 
     def _workers(self, obj: Raw) -> Any:
         if obj.workers == "auto":
-            return IntPositive(_cpu_count())
+            cpus = _cpu_count()
+            if cpus:
+                return IntPositive(cpus)
+            raise ValueError(
+                "The number of 'kresd' workers could not be determined automatically."
+                "The number can be specified manually in 'workers' configuration option."
+            )
         return obj.workers
 
     def _dnssec(self, obj: Raw) -> Any:
@@ -177,13 +178,9 @@ class KresConfig(SchemaNode):
         return obj.dns64
 
     def _validate(self) -> None:
-        try:
-            cpu_count = _cpu_count()
-            if int(self.workers) > 10 * cpu_count:
-                raise ValueError("refusing to run with more then instances 10 instances per cpu core")
-        except DataException:
-            # sometimes, we won't be able to get information about the cpu count
-            pass
+        cpus = _cpu_count()
+        if cpus and int(self.workers) > 10 * cpus:
+            raise ValueError("refusing to run with more then instances 10 instances per cpu core")
 
     def render_lua(self) -> str:
         # FIXME the `cwd` argument is used only for configuring control socket path
