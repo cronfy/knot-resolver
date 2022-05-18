@@ -4,12 +4,12 @@ from knot_resolver_manager.datamodel.network_schema import AddressRenumberingSch
 from knot_resolver_manager.datamodel.types import (
     DNSRecordTypeEnum,
     DomainName,
-    EscQuotesString,
+    EscapedStr,
     IDPattern,
     IPAddressOptionalPort,
     PolicyActionEnum,
     PolicyFlagEnum,
-    RawString,
+    RawStr,
     TimeUnit,
 )
 from knot_resolver_manager.utils import SchemaNode
@@ -26,7 +26,7 @@ class FilterSchema(SchemaNode):
     """
 
     suffix: Optional[DomainName] = None
-    pattern: Optional[RawString] = None
+    pattern: Optional[RawStr] = None
     qtype: Optional[DNSRecordTypeEnum] = None
 
 
@@ -42,7 +42,7 @@ class AnswerSchema(SchemaNode):
     """
 
     rtype: DNSRecordTypeEnum
-    rdata: EscQuotesString
+    rdata: EscapedStr
     ttl: TimeUnit = TimeUnit("1s")
     nodata: bool = False
 
@@ -68,7 +68,7 @@ class PolicySchema(SchemaNode):
     filter: Optional[FilterSchema] = None
     views: Optional[List[IDPattern]] = None
     options: Optional[List[PolicyFlagEnum]] = None
-    message: Optional[EscQuotesString] = None
+    message: Optional[EscapedStr] = None
     reroute: Optional[List[AddressRenumberingSchema]] = None
     answer: Optional[AnswerSchema] = None
     mirror: Optional[List[IPAddressOptionalPort]] = None
