@@ -25,7 +25,7 @@ stages:
   - test
   - respdiff
   - deploy
-  - pkgtest
+  - pkg
 
 .common: &common
   except:
@@ -521,10 +521,37 @@ obs:release:
 
 obs:odvr:
   <<: *obs_trigger
-  stage: pkgtest  # last stage to ensure it doesn't block anything
+  stage: pkg  # last stage to ensure it doesn't block anything
   only:
     - tags
   variables:
     OBS_REPO: knot-resolver-odvr
   when: manual
+# }}}
+
+# pkg {{{
+.setup-apkg: &setup-apkg
+  - python3 -m pip install pipx
+    # TEMPORARY: use test branch until `apkg test` is merged and released
+  - git clone -b test https://gitlab.nic.cz/packaging/apkg.git
+  - python3 -m pipx install -e apkg
+
+.pkg_test: &pkg_test
+  stage: pkg
+  needs:
+    - archive
+  tags:
+    - lxc
+    - amd64
+  script:
+    - *setup-apkg
+    - apkg build --build-dep
+
+pkg:debian-11:
+  <<: *pkg_test
+  image: $CI_REGISTRY/labs/lxc-gitlab-runner/debian-11
+
+pkg:fedora-35:
+  <<: *pkg_test
+  image: $CI_REGISTRY/labs/lxc-gitlab-runner/fedora-35
 # }}}
