@@ -22,7 +22,7 @@ from knot_resolver_manager.datamodel.rpz_schema import RPZSchema
 from knot_resolver_manager.datamodel.static_hints_schema import StaticHintsSchema
 from knot_resolver_manager.datamodel.stub_zone_schema import StubZoneSchema
 from knot_resolver_manager.datamodel.supervisor_schema import SupervisorSchema
-from knot_resolver_manager.datamodel.types import DomainName, IDPattern, IntPositive, UncheckedPath
+from knot_resolver_manager.datamodel.types import DomainName, EscQuotesString, IDPattern, IntPositive, UncheckedPath
 from knot_resolver_manager.datamodel.view_schema import ViewSchema
 from knot_resolver_manager.datamodel.webmgmt_schema import WebmgmtSchema
 from knot_resolver_manager.utils import SchemaNode
@@ -104,8 +104,8 @@ class KresConfig(SchemaNode):
         """
 
         id: IDPattern
-        nsid: Optional[str] = None
-        hostname: Optional[str] = None
+        nsid: Optional[EscQuotesString] = None
+        hostname: Optional[EscQuotesString] = None
         rundir: UncheckedPath = UncheckedPath(".")
         workers: Union[Literal["auto"], IntPositive] = IntPositive(1)
         management: ManagementSchema = ManagementSchema({"unix-socket": "./manager.sock"})
@@ -129,8 +129,8 @@ class KresConfig(SchemaNode):
     _PREVIOUS_SCHEMA = Raw
 
     id: IDPattern
-    nsid: Optional[str]
-    hostname: str
+    nsid: Optional[EscQuotesString]
+    hostname: EscQuotesString
     rundir: UncheckedPath
     workers: IntPositive
     management: ManagementSchema
@@ -153,7 +153,7 @@ class KresConfig(SchemaNode):
 
     def _hostname(self, obj: Raw) -> Any:
         if obj.hostname is None:
-            return socket.gethostname()
+            return EscQuotesString(socket.gethostname())
         return obj.hostname
 
     def _workers(self, obj: Raw) -> Any:
