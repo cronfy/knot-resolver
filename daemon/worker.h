@@ -93,17 +93,11 @@ void worker_task_unref(struct qr_task *task);
 
 void worker_task_timeout_inc(struct qr_task *task);
 
-int worker_add_tcp_connected(struct worker_ctx *worker,
-			     const struct sockaddr *addr,
-			     struct session *session);
-int worker_del_tcp_connected(struct worker_ctx *worker,
-			     const struct sockaddr *addr);
-int worker_del_tcp_waiting(struct worker_ctx *worker,
-			   const struct sockaddr* addr);
-struct session* worker_find_tcp_waiting(struct worker_ctx *worker,
-					       const struct sockaddr* addr);
-struct session* worker_find_tcp_connected(struct worker_ctx *worker,
-					       const struct sockaddr* addr);
+int worker_add_tcp_connected(const struct sockaddr *addr, struct session *session);
+int worker_del_tcp_connected(const struct sockaddr *addr);
+int worker_del_tcp_waiting(const struct sockaddr* addr);
+struct session* worker_find_tcp_waiting(const struct sockaddr* addr);
+struct session* worker_find_tcp_connected(const struct sockaddr* addr);
 knot_pkt_t *worker_task_get_pktbuf(const struct qr_task *task);
 
 struct request_ctx *worker_task_get_request(struct qr_task *task);

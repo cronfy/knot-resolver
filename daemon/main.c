@@ -145,7 +145,7 @@ static void help(int argc, char *argv[])
 }
 
 /** \return exit code for main()  */
-static int run_worker(uv_loop_t *loop, struct engine *engine, bool leader, struct args *args)
+static int run_worker(uv_loop_t *loop, bool leader, struct args *args)
 {
 	/* Only some kinds of stdin work with uv_pipe_t.
 	 * Otherwise we would abort() from libuv e.g. with </dev/null */
@@ -595,7 +595,7 @@ int main(int argc, char **argv)
 	}
 
 	/* Run the event loop */
-	ret = run_worker(loop, the_engine, fork_id == 0, the_args);
+	ret = run_worker(loop, fork_id == 0, the_args);
 
 cleanup:/* Cleanup. */
 	network_close_force();

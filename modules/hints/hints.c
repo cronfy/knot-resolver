@@ -539,10 +539,9 @@ static char* hint_root(void *env, struct kr_module *module, const char *args)
 
 static char* hint_root_file(void *env, struct kr_module *module, const char *args)
 {
-	struct engine *engine = env;
 	const char *err_msg = engine_hint_root_file(args);
 	if (err_msg) {
-		luaL_error(engine->L, "error when opening '%s': %s", args, err_msg);
+		luaL_error(the_engine->L, "error when opening '%s': %s", args, err_msg);
 	}
 	return strdup(err_msg ? err_msg : "");
 }

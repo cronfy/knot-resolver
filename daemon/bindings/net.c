@@ -515,18 +515,17 @@ static int net_bufsize(lua_State *L)
 /** Set TCP pipelining size. */
 static int net_pipeline(lua_State *L)
 {
-	struct worker_ctx *worker = the_worker;
-	if (!worker) {
+	if (!the_worker) {
 		return 0;
 	}
 	if (!lua_isnumber(L, 1)) {
-		lua_pushinteger(L, worker->tcp_pipeline_max);
+		lua_pushinteger(L, the_worker->tcp_pipeline_max);
 		return 1;
 	}
 	int len = lua_tointeger(L, 1);
 	if (len < 0 || len > UINT16_MAX)
 		lua_error_p(L, "tcp_pipeline must be within <0, " STR(UINT16_MAX) ">");
-	worker->tcp_pipeline_max = len;
+	the_worker->tcp_pipeline_max = len;
 	lua_pushinteger(L, len);
 	return 1;
 }
@@ -554,7 +553,7 @@ static int net_tls(lua_State *L)
 	if ((lua_gettop(L) != 2) || !lua_isstring(L, 1) || !lua_isstring(L, 2))
 		lua_error_p(L, "net.tls takes two parameters: (\"cert_file\", \"key_file\")");
 
-	int r = tls_certificate_set(the_network, lua_tostring(L, 1), lua_tostring(L, 2));
+	int r = tls_certificate_set(lua_tostring(L, 1), lua_tostring(L, 2));
 	lua_error_maybe(L, r);
 
 	lua_pushboolean(L, true);

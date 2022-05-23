@@ -686,9 +686,9 @@ static time_t _get_end_entity_expiration(gnutls_certificate_credentials_t creds)
 	return ret;
 }
 
-int tls_certificate_set(struct network *net, const char *tls_cert, const char *tls_key)
+int tls_certificate_set(const char *tls_cert, const char *tls_key)
 {
-	if (!net) {
+	if (kr_fails_assert(the_network)) {
 		return kr_error(EINVAL);
 	}
 
@@ -730,11 +730,11 @@ int tls_certificate_set(struct network *net, const char *tls_cert, const char *t
 	tls_credentials->valid_until = _get_end_entity_expiration(tls_credentials->credentials);
 
 	/* Exchange the x509 credentials */
-	struct tls_credentials *old_credentials = net->tls_credentials;
+	struct tls_credentials *old_credentials = the_network->tls_credentials;
 
 	/* Start using the new x509_credentials */
-	net->tls_credentials = tls_credentials;
-	tls_credentials_log_pins(net->tls_credentials);
+	the_network->tls_credentials = tls_credentials;
+	tls_credentials_log_pins(the_network->tls_credentials);
 
 	if (old_credentials) {
 		err = tls_credentials_release(old_credentials);
@@ -1058,8 +1058,7 @@ static int client_verify_certificate(gnutls_session_t tls_session)
 		return client_verify_certchain(ctx->c.tls_session, ctx->params->hostname);
 }
 
-struct tls_client_ctx *tls_client_ctx_new(tls_client_param_t *entry,
-					    struct worker_ctx *worker)
+struct tls_client_ctx *tls_client_ctx_new(tls_client_param_t *entry)
 {
 	struct tls_client_ctx *ctx = calloc(1, sizeof (struct tls_client_ctx));
 	if (!ctx) {

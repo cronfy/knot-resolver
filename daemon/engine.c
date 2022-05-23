@@ -629,7 +629,6 @@ void engine_deinit(void)
 	array_clear(the_engine->modules);
 	array_clear(the_engine->backends);
 	free(the_engine->hostname);
-
 	mp_delete(the_engine->pool.ctx);
 
 	the_engine = NULL;
@@ -763,7 +762,7 @@ int engine_register(const char *name, const char *precedence, const char* ref)
 
 	} else if (ret == kr_error(ENOENT)) {
 		/* No luck with C module, so try to load and .init() lua module. */
-		ret = ffimodule_register_lua(the_engine, module, name);
+		ret = ffimodule_register_lua(module, name);
 		if (ret != 0) {
 			kr_log_error(SYSTEM, "failed to load module '%s'\n", name);
 		}

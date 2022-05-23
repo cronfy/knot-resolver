@@ -40,7 +40,7 @@ static void check_bufsize(uv_handle_t* handle)
 	 * This is magic presuming we can pull in a whole recvmmsg width in one wave.
 	 * Linux will double this the bufsize wanted.
 	 */
-	const int bufsize_want = 2 * sizeof( ((struct worker_ctx *)NULL)->wire_buf ) ;
+	const int bufsize_want = 2 * sizeof(the_worker->wire_buf) ;
 	negotiate_bufsize(uv_recv_buffer_size, handle, bufsize_want);
 	negotiate_bufsize(uv_send_buffer_size, handle, bufsize_want);
 }
@@ -324,8 +324,8 @@ void tcp_timeout_trigger(uv_timer_t *timer)
 			kr_log_debug(IO, "=> closing connection to '%s'\n",
 				       peer_str ? peer_str : "");
 			if (session_flags(s)->outgoing) {
-				worker_del_tcp_waiting(the_worker, peer);
-				worker_del_tcp_connected(the_worker, peer);
+				worker_del_tcp_waiting(peer);
+				worker_del_tcp_connected(peer);
 			}
 			session_close(s);
 		}
@@ -509,7 +509,6 @@ static void _tcp_accept(uv_stream_t *master, int status, bool tls, bool http)
 		return;
 	}
 
-	struct worker_ctx *worker = the_worker;
 	uv_tcp_t *client = malloc(sizeof(uv_tcp_t));
 	if (!client) {
 		return;
@@ -518,8 +517,8 @@ static void _tcp_accept(uv_stream_t *master, int status, bool tls, bool http)
 			    SOCK_STREAM, AF_UNSPEC, tls, http);
 	if (res) {
 		if (res == UV_EMFILE) {
-			worker->too_many_open = true;
-			worker->rconcurrent_highwatermark = worker->stats.rconcurrent;
+			the_worker->too_many_open = true;
+			the_worker->rconcurrent_highwatermark = the_worker->stats.rconcurrent;
 		}
 		/* Since res isn't OK struct session wasn't allocated \ borrowed.
 		 * We must release client handle only.

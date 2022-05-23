@@ -271,10 +271,10 @@ static kr_layer_api_t *l_ffi_layer_create(lua_State *L, struct kr_module *module
 
 #undef LAYER_REGISTER
 
-int ffimodule_register_lua(struct engine *engine, struct kr_module *module, const char *name)
+int ffimodule_register_lua(struct kr_module *module, const char *name)
 {
 	/* Register module in Lua */
-	lua_State *L = engine->L;
+	lua_State *L = the_engine->L;
 	lua_getglobal(L, "require");
 	lua_pushfstring(L, "kres_modules.%s", name);
 	if (lua_pcall(L, 1, LUA_MULTRET, 0) != 0) {
