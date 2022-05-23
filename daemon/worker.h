@@ -25,10 +25,10 @@ KR_EXPORT extern struct worker_ctx *the_worker;
 
 /** Create and initialize the worker.
  * \return error code (ENOMEM) */
-int worker_init(struct engine *engine, int worker_count);
+int worker_init();
 
 /** Destroy the worker (free memory). */
-void worker_deinit(void);
+void worker_deinit();
 
 /**
  * Process an incoming packet (query from a client or answer from upstream).
@@ -163,7 +163,6 @@ typedef array_t(const char *) doh_headerlist_t;
 
 /** \details Worker state is meant to persist during the whole life of daemon. */
 struct worker_ctx {
-	struct engine *engine;
 	uv_loop_t *loop;
 	int count;  /** unreliable, does not count systemd instance, do not use */
 	int vars_table_ref;

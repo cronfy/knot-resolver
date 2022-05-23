@@ -93,7 +93,7 @@ void udp_recv(uv_udp_t *handle, ssize_t nread, const uv_buf_t *buf,
 	struct proxy_result proxy;
 	bool has_proxy = false;
 	if (!session_flags(s)->outgoing && proxy_header_present(data, data_len)) {
-		if (!proxy_allowed(&the_worker->engine->net, comm_addr)) {
+		if (!proxy_allowed(comm_addr)) {
 			kr_log_debug(IO, "<= ignoring PROXYv2 UDP from disallowed address '%s'\n",
 					kr_straddr(comm_addr));
 			return;
@@ -310,8 +310,7 @@ void tcp_timeout_trigger(uv_timer_t *timer)
 				return;
 			}
 		}
-		const struct network *net = &the_worker->engine->net;
-		uint64_t idle_in_timeout = net->tcp.in_idle_timeout;
+		uint64_t idle_in_timeout = the_network->tcp.in_idle_timeout;
 		uint64_t last_activity = session_last_activity(s);
 		uint64_t idle_time = kr_now() - last_activity;
 		if (idle_time < idle_in_timeout) {
@@ -367,7 +366,7 @@ static void tcp_recv(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf)
 	const struct sockaddr *dst_addr = NULL;
 	if (!session_flags(s)->outgoing && !session_flags(s)->no_proxy &&
 			proxy_header_present(data, data_len)) {
-		if (!proxy_allowed(&the_worker->engine->net, src_addr)) {
+		if (!proxy_allowed(src_addr)) {
 			if (kr_log_is_debug(IO, NULL)) {
 				kr_log_debug(IO, "<= connection to '%s': PROXYv2 not allowed "
 						"for this peer, close\n",
@@ -562,15 +561,14 @@ static void _tcp_accept(uv_stream_t *master, int status, bool tls, bool http)
 	 * It will re-check every half of a request time limit if the connection
 	 * is idle and should be terminated, this is an educated guess. */
 
-	const struct network *net = &worker->engine->net;
-	uint64_t idle_in_timeout = net->tcp.in_idle_timeout;
+	uint64_t idle_in_timeout = the_network->tcp.in_idle_timeout;
 
 	uint64_t timeout = KR_CONN_RTT_MAX / 2;
 	if (tls) {
 		timeout += TLS_MAX_HANDSHAKE_TIME;
 		struct tls_ctx *ctx = session_tls_get_server_ctx(s);
 		if (!ctx) {
-			ctx = tls_new(worker);
+			ctx = tls_new();
 			if (!ctx) {
 				session_close(s);
 				return;
@@ -777,7 +775,7 @@ void io_tty_process_input(uv_stream_t *stream, ssize_t nread, const uv_buf_t *bu
 
 	/** Moving pointer to end of buffer with incomplete command. */
 	char *pbuf = data->buf + data->blen;
-	lua_State *L = the_worker->engine->L;
+	lua_State *L = the_engine->L;
 	while (cmd != NULL) {
 		/* Last command is incomplete - save it and execute later */
 		if (incomplete_cmd && cmd_next == NULL) {

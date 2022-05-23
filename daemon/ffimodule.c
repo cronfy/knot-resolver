@@ -74,7 +74,7 @@ static int l_ffi_modcb(lua_State *L, struct kr_module *module)
 static int l_ffi_deinit(struct kr_module *module)
 {
 	/* Call .deinit(), if it exists. */
-	lua_State *L = the_worker->engine->L;
+	lua_State *L = the_engine->L;
 	lua_getglobal(L, module->name);
 	lua_getfield(L, -1, "deinit");
 	const int ret = l_ffi_modcb(L, module);
@@ -102,7 +102,7 @@ static int l_ffi_call_layer(kr_layer_t *ctx, int slot_ix)
 	const int wrap_slot = l_ffi_wrap_slots[slot_ix];
 	const int cb_slot = ctx->api->cb_slots[slot_ix];
 	kr_require(wrap_slot > 0 && cb_slot > 0);
-	lua_State *L = the_worker->engine->L;
+	lua_State *L = the_engine->L;
 	lua_rawgeti(L, LUA_REGISTRYINDEX, wrap_slot);
 	lua_rawgeti(L, LUA_REGISTRYINDEX, cb_slot);
 	/* We pass the content of *ctx via a global structure to avoid

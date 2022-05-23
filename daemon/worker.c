@@ -326,7 +326,8 @@ static void free_wire(const struct request_ctx *ctx)
 #endif
 /* Helper functions for transport selection */
 static inline bool is_tls_capable(struct sockaddr *address) {
-	tls_client_param_t *tls_entry = tls_client_param_get(the_worker->engine->net.tls_client_params, address);
+	tls_client_param_t *tls_entry = tls_client_param_get(
+			the_network->tls_client_params, address);
 	return tls_entry;
 }
 
@@ -479,8 +480,7 @@ static int request_start(struct request_ctx *ctx, knot_pkt_t *query)
 
 	/* Start resolution */
 	struct worker_ctx *worker = ctx->worker;
-	struct engine *engine = worker->engine;
-	kr_resolve_begin(req, &engine->resolver);
+	kr_resolve_begin(req, the_resolver);
 	worker->stats.queries += 1;
 	return kr_ok();
 }
@@ -490,7 +490,7 @@ static void request_free(struct request_ctx *ctx)
 	struct worker_ctx *worker = ctx->worker;
 	/* Dereference any Lua vars table if exists */
 	if (ctx->req.vars_ref != LUA_NOREF) {
-		lua_State *L = worker->engine->L;
+		lua_State *L = the_engine->L;
 		/* Get worker variables table */
 		lua_rawgeti(L, LUA_REGISTRYINDEX, worker->vars_table_ref);
 		/* Get next free element (position 0) and store it under current reference (forming a list) */
@@ -529,7 +529,7 @@ static struct qr_task *qr_task_create(struct request_ctx *ctx)
 	 * for UDP answers from upstream *and* from cache
 	 * and for sending queries upstream */
 	uint16_t pktbuf_max = KR_EDNS_PAYLOAD;
-	const knot_rrset_t *opt_our = ctx->worker->engine->resolver.upstream_opt_rr;
+	const knot_rrset_t *opt_our = the_resolver->upstream_opt_rr;
 	if (opt_our) {
 		pktbuf_max = MAX(pktbuf_max, knot_edns_get_payload(opt_our));
 	}
@@ -1509,8 +1509,8 @@ static int tcp_task_make_connection(struct qr_task *task, const struct sockaddr 
 
 	/* Check if there must be TLS */
 	struct tls_client_ctx *tls_ctx = NULL;
-	struct network *net = &worker->engine->net;
-	tls_client_param_t *entry = tls_client_param_get(net->tls_client_params, addr);
+	tls_client_param_t *entry = tls_client_param_get(
+			the_network->tls_client_params, addr);
 	if (entry) {
 		/* Address is configured to be used with TLS.
 		 * We need to allocate auxiliary data structure. */
@@ -2009,7 +2009,7 @@ knot_pkt_t *worker_resolve_mk_pkt_dname(knot_dname_t *qname, uint16_t qtype, uin
 
 	/* Add OPT RR, including wire format so modules can see both representations.
 	 * knot_pkt_put() copies the outside; we need to duplicate the inside manually. */
-	knot_rrset_t *opt = knot_rrset_copy(the_worker->engine->resolver.downstream_opt_rr, NULL);
+	knot_rrset_t *opt = knot_rrset_copy(the_resolver->downstream_opt_rr, NULL);
 	if (!opt) {
 		knot_pkt_free(pkt);
 		return NULL;
@@ -2228,28 +2228,29 @@ void worker_deinit(void)
 	the_worker = NULL;
 }
 
-int worker_init(struct engine *engine, int worker_count)
+int worker_init(void)
 {
-	if (kr_fails_assert(engine && engine->L && the_worker == NULL))
+	if (kr_fails_assert(the_worker == NULL))
 		return kr_error(EINVAL);
-	kr_bindings_register(engine->L);
+	kr_bindings_register(the_engine->L); // TODO move
 
 	/* Create main worker. */
 	struct worker_ctx *worker = &the_worker_value;
 	memset(worker, 0, sizeof(*worker));
-	worker->engine = engine;
 
 	uv_loop_t *loop = uv_default_loop();
 	worker->loop = loop;
 
+	static const int worker_count = 1;
 	worker->count = worker_count;
 
 	/* Register table for worker per-request variables */
-	lua_newtable(engine->L);
-	lua_setfield(engine->L, -2, "vars");
-	lua_getfield(engine->L, -1, "vars");
-	worker->vars_table_ref = luaL_ref(engine->L, LUA_REGISTRYINDEX);
-	lua_pop(engine->L, 1);
+	struct lua_State *L = the_engine->L;
+	lua_newtable(L);
+	lua_setfield(L, -2, "vars");
+	lua_getfield(L, -1, "vars");
+	worker->vars_table_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+	lua_pop(L, 1);
 
 	worker->tcp_pipeline_max = MAX_PIPELINED;
 	worker->out_addr4.sin_family = AF_UNSPEC;
@@ -2262,29 +2263,29 @@ int worker_init(struct engine *engine, int worker_count)
 	worker->next_request_uid = UINT16_MAX + 1;
 
 	/* Set some worker.* fields in Lua */
-	lua_getglobal(engine->L, "worker");
+	lua_getglobal(L, "worker");
 	pid_t pid = getpid();
 
 	auto_free char *pid_str = NULL;
 	const char *inst_name = getenv("SYSTEMD_INSTANCE");
 	if (inst_name) {
-		lua_pushstring(engine->L, inst_name);
+		lua_pushstring(L, inst_name);
 	} else {
 		ret = asprintf(&pid_str, "%ld", (long)pid);
 		kr_assert(ret > 0);
-		lua_pushstring(engine->L, pid_str);
+		lua_pushstring(L, pid_str);
 	}
-	lua_setfield(engine->L, -2, "id");
+	lua_setfield(L, -2, "id");
 
-	lua_pushnumber(engine->L, pid);
-	lua_setfield(engine->L, -2, "pid");
-	lua_pushnumber(engine->L, worker_count);
-	lua_setfield(engine->L, -2, "count");
+	lua_pushnumber(L, pid);
+	lua_setfield(L, -2, "pid");
+	lua_pushnumber(L, worker_count);
+	lua_setfield(L, -2, "count");
 
 	char cwd[PATH_MAX];
 	get_workdir(cwd, sizeof(cwd));
-	lua_pushstring(engine->L, cwd);
-	lua_setfield(engine->L, -2, "cwd");
+	lua_pushstring(L, cwd);
+	lua_setfield(L, -2, "cwd");
 
 	the_worker = worker;
 	loop->data = the_worker;

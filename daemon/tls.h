@@ -121,7 +121,6 @@ struct tls_common_ctx {
 	ssize_t consumed;
 	uint8_t recv_buf[16384];
 	tls_handshake_cb handshake_cb;
-	struct worker_ctx *worker;
 	size_t write_queue_size;
 };
 
@@ -146,7 +145,7 @@ struct tls_client_ctx {
 };
 
 /*! Create an empty TLS context in query context */
-struct tls_ctx* tls_new(struct worker_ctx *worker);
+struct tls_ctx* tls_new(void);
 
 /*! Close a TLS context (call gnutls_bye()) */
 void tls_close(struct tls_common_ctx *ctx);
@@ -183,7 +182,7 @@ void tls_credentials_free(struct tls_credentials *tls_credentials);
 void tls_credentials_log_pins(struct tls_credentials *tls_credentials);
 
 /*! Generate new ephemeral TLS credentials. */
-struct tls_credentials * tls_get_ephemeral_credentials(struct engine *engine);
+struct tls_credentials * tls_get_ephemeral_credentials();
 
 /*! Get TLS handshake state. */
 tls_hs_state_t tls_get_hs_state(const struct tls_common_ctx *ctx);
