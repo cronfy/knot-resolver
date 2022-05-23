@@ -518,7 +518,6 @@ struct endpoint {
 };
 struct request_ctx {
 	struct kr_request req;
-	struct worker_ctx *worker;
 	struct qr_task *task;
 	/* beware: hidden stub, to avoid hardcoding sockaddr lengths */
 };
