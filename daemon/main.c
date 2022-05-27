@@ -495,14 +495,14 @@ int main(int argc, char **argv)
 
 	kr_crypto_init();
 
+	network_init(uv_default_loop(), TCP_BACKLOG_DEFAULT);
+
 	/* Create a server engine. */
 	ret = engine_init();
 	if (ret != 0) {
 		kr_log_error(SYSTEM, "failed to initialize engine: %s\n", kr_strerror(ret));
 		return EXIT_FAILURE;
 	}
-
-	network_init(uv_default_loop(), TCP_BACKLOG_DEFAULT);
 
 	/* Create resolver context. */
 	ret = kr_resolver_init(&the_engine->modules, &the_engine->pool);
@@ -598,11 +598,12 @@ int main(int argc, char **argv)
 	ret = run_worker(loop, fork_id == 0, the_args);
 
 cleanup:/* Cleanup. */
-	network_close_force();
+	network_unregister();
+
 	kr_resolver_deinit();
 	worker_deinit();
-	network_deinit();
 	engine_deinit();
+	network_deinit();
 	if (loop != NULL) {
 		uv_loop_close(loop);
 	}

@@ -109,7 +109,15 @@ struct network {
 /** Pointer to the singleton network state. NULL if not initialized. */
 KR_EXPORT extern struct network *the_network;
 
+/** Initializes the network. */
 void network_init(uv_loop_t *loop, int tcp_backlog);
+
+/** Unregisters endpoints. Should be called before `network_deinit`
+ * and `engine_deinit`. */
+void network_unregister(void);
+
+/** Deinitializes the network. `network_unregister` should be called before
+ * this and before `engine_deinit`. */
 void network_deinit(void);
 
 /** Start listening on addr#port with flags.

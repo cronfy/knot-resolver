@@ -24,7 +24,11 @@ struct engine {
 /** Pointer to the singleton engine state. NULL if not initialized. */
 KR_EXPORT extern struct engine *the_engine;
 
+/** Initializes the engine. */
 int engine_init(void);
+
+/* Deinitializes the engine. `network_unregister` should be called before
+ * this and before `network_deinit`. */
 void engine_deinit(void);
 
 /** Perform a lua command within the sandbox.

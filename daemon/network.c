@@ -284,10 +284,14 @@ void network_proxy_free_addr_data(trie_t* trie)
 	trie_it_free(it);
 }
 
-void network_deinit(void)
+void network_unregister(void)
 {
 	network_close_force();
 	trie_apply(the_network->endpoint_kinds, kind_unregister, the_engine->L);
+}
+
+void network_deinit(void)
+{
 	trie_free(the_network->endpoint_kinds);
 	trie_free(the_network->endpoints);
 	network_proxy_free_addr_data(the_network->proxy_addrs4);
