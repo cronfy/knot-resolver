@@ -9,7 +9,6 @@ from knot_resolver_manager.datamodel.types import (
     IPAddressOptionalPort,
     PolicyActionEnum,
     PolicyFlagEnum,
-    RawStr,
     TimeUnit,
 )
 from knot_resolver_manager.utils import SchemaNode
@@ -26,7 +25,7 @@ class FilterSchema(SchemaNode):
     """
 
     suffix: Optional[DomainName] = None
-    pattern: Optional[RawStr] = None
+    pattern: Optional[EscapedStr] = None
     qtype: Optional[DNSRecordTypeEnum] = None
 
 

@@ -1,6 +1,6 @@
 from typing import List, Optional
 
-from knot_resolver_manager.datamodel.types import IPNetwork, PolicyFlagEnum, RawStr
+from knot_resolver_manager.datamodel.types import EscapedStr, IPNetwork, PolicyFlagEnum
 from knot_resolver_manager.utils import SchemaNode
 
 
@@ -15,7 +15,7 @@ class ViewSchema(SchemaNode):
     """
 
     subnets: Optional[List[IPNetwork]] = None
-    tsig: Optional[List[RawStr]] = None
+    tsig: Optional[List[EscapedStr]] = None
     options: Optional[List[PolicyFlagEnum]] = None
 
     def _validate(self) -> None:
