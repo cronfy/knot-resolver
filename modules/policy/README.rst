@@ -36,11 +36,20 @@ A *filter* selects which queries will be affected by specified Actions_. There a
 
    Applies the action if query name suffix matches one of suffixes in the table (useful for "is domain in zone" rules).
 
-.. note:: For speed this filter requires domain names in DNS wire format, not textual representation, so each label in the name must be prefixed with its length. Always use convenience function :func:`policy.todnames` for automatic conversion from strings! For example:
-
    .. code-block:: lua
 
       policy.add(policy.suffix(policy.DENY, policy.todnames({'example.com', 'example.net'})))
+
+.. note:: For speed this filter requires domain names in DNS wire format, not textual representation, so each label in the name must be prefixed with its length. Always use convenience function :func:`policy.todnames` for automatic conversion from strings! For example:
+
+.. _IDN:
+
+.. note:: Non-ASCII is not supported.
+
+   Knot Resolver does not provide any convenience support for IDN.
+   Therefore everywhere (all configuration, logs, RPZ files) you need to deal with the
+   `xn\-\- forms <https://en.wikipedia.org/wiki/Internationalized_domain_name#Example_of_IDNA_encoding>`_
+   of domain name labels, instead of directly using unicode characters.
 
 .. function:: domains(action, domain_table)
 
@@ -143,6 +152,17 @@ Following actions stop the policy matching on the query, i.e. other rules are no
 .. py:attribute:: REFUSE
 
    Terminate query resolution and return REFUSED to the requestor.
+
+.. py:attribute:: NO_ANSWER
+
+   Terminate query resolution and do not return any answer to the requestor.
+
+   .. warning:: During normal operation, an answer should always be returned.
+      Deliberate query drops are indistinguishable from packet loss and may
+      cause problems as described in :rfc:`8906`. Only use :any:`NO_ANSWER`
+      on very specific occasions, e.g. as a defense mechanism during an attack,
+      and prefer other actions (e.g. :any:`DROP` or :any:`REFUSE`) for normal
+      operation.
 
 .. py:attribute:: TC
 
@@ -679,6 +699,8 @@ Response policy zones
      .. code-block:: lua
 
         log_groups({'policy'})
+
+     See also :ref:`non-ASCII support note <IDN>`.
 
 
 .. function:: rpz(action, path, [watch = true])

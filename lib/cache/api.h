@@ -11,10 +11,6 @@
 #include "lib/defines.h"
 #include "contrib/ucw/config.h" /*uint*/
 
-/** When knot_pkt is passed from cache without ->wire, this is the ->size. */
-static const size_t PKT_SIZE_NOWIRE = -1;
-
-
 #include "lib/module.h"
 /* Prototypes for the 'cache' module implementation. */
 int cache_peek(kr_layer_t *ctx, knot_pkt_t *pkt);
@@ -37,6 +33,8 @@ struct kr_cache
 
 	uv_timer_t *health_timer; /**< Timer used for kr_cache_check_health() */
 };
+// https://datatracker.ietf.org/doc/html/rfc2181#section-8
+#define TTL_MAX_MAX ((1u << 31) - 1)
 
 /**
  * Open/create cache with provided storage options.

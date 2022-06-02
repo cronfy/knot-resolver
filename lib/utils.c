@@ -31,6 +31,28 @@
 #include <sys/statvfs.h>
 #include <sys/un.h>
 
+struct __attribute__((packed)) kr_sockaddr_key {
+	int family;
+};
+
+struct __attribute__((packed)) kr_sockaddr_in_key {
+	int family;
+	char address[sizeof(((struct sockaddr_in *) NULL)->sin_addr)];
+	uint16_t port;
+};
+
+struct __attribute__((packed)) kr_sockaddr_in6_key {
+	int family;
+	char address[sizeof(((struct sockaddr_in6 *) NULL)->sin6_addr)];
+	uint32_t scope;
+	uint16_t port;
+};
+
+struct __attribute((packed)) kr_sockaddr_un_key {
+	int family;
+	char path[sizeof(((struct sockaddr_un *) NULL)->sun_path)];
+};
+
 /* Logging & debugging */
 bool kr_dbg_assertion_abort = DBG_ASSERTION_ABORT;
 int kr_dbg_assertion_fork = DBG_ASSERTION_FORK;
@@ -109,7 +131,7 @@ char* kr_strcatdup(unsigned n, ...)
 	/* Allocate result and fill */
 	char *result = NULL;
 	if (total_len > 0) {
-		if (unlikely(total_len + 1 == 0)) return NULL;
+		if (unlikely(total_len == SIZE_MAX)) return NULL;
 		result = malloc(total_len + 1);
 	}
 	if (result) {
@@ -284,6 +306,130 @@ int kr_sockaddr_len(const struct sockaddr *addr)
 	}
 }
 
+ssize_t kr_sockaddr_key(struct kr_sockaddr_key_storage *dst,
+                        const struct sockaddr *addr)
+{
+	kr_require(addr);
+
+	switch (addr->sa_family) {
+	case AF_INET:;
+		const struct sockaddr_in *addr_in = (const struct sockaddr_in *) addr;
+		struct kr_sockaddr_in_key *inkey = (struct kr_sockaddr_in_key *) dst;
+		inkey->family = AF_INET;
+		memcpy(&inkey->address, &addr_in->sin_addr, sizeof(inkey->address));
+		memcpy(&inkey->port, &addr_in->sin_port, sizeof(inkey->port));
+		return sizeof(*inkey);
+
+	case AF_INET6:;
+		const struct sockaddr_in6 *addr_in6 = (const struct sockaddr_in6 *) addr;
+		struct kr_sockaddr_in6_key *in6key = (struct kr_sockaddr_in6_key *) dst;
+		in6key->family = AF_INET6;
+		memcpy(&in6key->address, &addr_in6->sin6_addr, sizeof(in6key->address));
+		memcpy(&in6key->port, &addr_in6->sin6_port, sizeof(in6key->port));
+		if (kr_sockaddr_link_local(addr))
+			memcpy(&in6key->scope, &addr_in6->sin6_scope_id, sizeof(in6key->scope));
+		else
+			in6key->scope = 0;
+		return sizeof(*in6key);
+
+	case AF_UNIX:;
+		const struct sockaddr_un *addr_un = (const struct sockaddr_un *) addr;
+		struct kr_sockaddr_un_key *unkey = (struct kr_sockaddr_un_key *) dst;
+		unkey->family = AF_UNIX;
+		size_t pathlen = strnlen(addr_un->sun_path, sizeof(unkey->path));
+		if (pathlen == 0 || pathlen >= sizeof(unkey->path)) {
+			/* Abstract sockets are not supported - we would need
+			 * to also supply a length value for the abstract
+			 * pathname.
+			 *
+			 * UNIX socket path should be null-terminated.
+			 *
+			 * See unix(7). */
+			return kr_error(EINVAL);
+		}
+
+		pathlen += 1; /* Include null-terminator */
+		strncpy(unkey->path, addr_un->sun_path, pathlen);
+		return offsetof(struct kr_sockaddr_un_key, path) + pathlen;
+
+	default:
+		return kr_error(EAFNOSUPPORT);
+	}
+}
+
+struct sockaddr *kr_sockaddr_from_key(struct sockaddr_storage *dst,
+                                      const char *key)
+{
+	kr_require(key);
+
+	switch (((struct kr_sockaddr_key *) key)->family) {
+	case AF_INET:;
+		const struct kr_sockaddr_in_key *inkey = (struct kr_sockaddr_in_key *) key;
+		struct sockaddr_in *addr_in = (struct sockaddr_in *) dst;
+		addr_in->sin_family = AF_INET;
+		memcpy(&addr_in->sin_addr, &inkey->address, sizeof(inkey->address));
+		memcpy(&addr_in->sin_port, &inkey->port, sizeof(inkey->port));
+		return (struct sockaddr *) addr_in;
+
+	case AF_INET6:;
+		const struct kr_sockaddr_in6_key *in6key = (struct kr_sockaddr_in6_key *) key;
+		struct sockaddr_in6 *addr_in6 = (struct sockaddr_in6 *) dst;
+		addr_in6->sin6_family = AF_INET6;
+		memcpy(&addr_in6->sin6_addr, &in6key->address, sizeof(in6key->address));
+		memcpy(&addr_in6->sin6_port, &in6key->port, sizeof(in6key->port));
+		memcpy(&addr_in6->sin6_scope_id, &in6key->scope, sizeof(in6key->scope));
+		return (struct sockaddr *) addr_in6;
+
+	case AF_UNIX:;
+		const struct kr_sockaddr_un_key *unkey = (struct kr_sockaddr_un_key *) key;
+		struct sockaddr_un *addr_un = (struct sockaddr_un *) dst;
+		addr_un->sun_family = AF_UNIX;
+		strncpy(addr_un->sun_path, unkey->path, sizeof(unkey->path));
+		return (struct sockaddr *) addr_un;
+
+	default:
+		kr_assert(false);
+		return NULL;
+	}
+}
+
+bool kr_sockaddr_key_same_addr(const char *key_a, const char *key_b)
+{
+	const struct kr_sockaddr_in6_key *kkey_a = (struct kr_sockaddr_in6_key *) key_a;
+	const struct kr_sockaddr_in6_key *kkey_b = (struct kr_sockaddr_in6_key *) key_b;
+
+	if (kkey_a->family != kkey_b->family)
+		return false;
+
+	ptrdiff_t offset;
+	switch (kkey_a->family) {
+		case AF_INET:
+			offset = offsetof(struct kr_sockaddr_in_key, address);
+			break;
+		case AF_INET6:
+			if (unlikely(kkey_a->scope != kkey_b->scope))
+				return false;
+			offset = offsetof(struct kr_sockaddr_in6_key, address);
+			break;
+
+		case AF_UNIX:;
+			const struct kr_sockaddr_un_key *unkey_a =
+				(struct kr_sockaddr_un_key *) key_a;
+			const struct kr_sockaddr_un_key *unkey_b =
+				(struct kr_sockaddr_un_key *) key_b;
+
+			return strncmp(unkey_a->path, unkey_b->path,
+			               sizeof(unkey_a->path)) == 0;
+
+		default:
+			kr_assert(false);
+			return false;
+	}
+
+	size_t len = kr_family_len(kkey_a->family);
+	return memcmp(key_a + offset, key_b + offset, len) == 0;
+}
+
 int kr_sockaddr_cmp(const struct sockaddr *left, const struct sockaddr *right)
 {
 	if (!left || !right) {
@@ -335,9 +481,14 @@ void kr_inaddr_set_port(struct sockaddr *addr, uint16_t port)
 		return;
 	}
 	switch (addr->sa_family) {
-	case AF_INET:  ((struct sockaddr_in *)addr)->sin_port = htons(port);
-	case AF_INET6: ((struct sockaddr_in6 *)addr)->sin6_port = htons(port);
-	default: break;
+	case AF_INET:
+		((struct sockaddr_in *)addr)->sin_port = htons(port);
+		break;
+	case AF_INET6:
+		((struct sockaddr_in6 *)addr)->sin6_port = htons(port);
+		break;
+	default:
+		break;
 	}
 }
 
@@ -383,7 +534,10 @@ int kr_straddr_family(const char *addr)
 	if (strchr(addr, ':')) {
 		return AF_INET6;
 	}
-	return AF_INET;
+	if (strchr(addr, '.')) {
+		return AF_INET;
+	}
+	return kr_error(EINVAL);
 }
 
 int kr_family_len(int family)
@@ -428,7 +582,6 @@ struct sockaddr * kr_straddr_socket(const char *addr, int port, knot_mm_t *pool)
 		return (struct sockaddr *)res;
 	}
 	default:
-		kr_assert(false);
 		return NULL;
 	}
 }
@@ -443,6 +596,7 @@ int kr_straddr_subnet(void *dst, const char *addr)
 	int family = kr_straddr_family(addr);
 	if (family != AF_INET && family != AF_INET6)
 		return kr_error(EINVAL);
+	const int max_len = (family == AF_INET6) ? 128 : 32;
 	auto_free char *addr_str = strdup(addr);
 	char *subnet = strchr(addr_str, '/');
 	if (subnet) {
@@ -450,13 +604,12 @@ int kr_straddr_subnet(void *dst, const char *addr)
 		subnet += 1;
 		bit_len = strtol(subnet, NULL, 10);
 		/* Check client subnet length */
-		const int max_len = (family == AF_INET6) ? 128 : 32;
 		if (bit_len < 0 || bit_len > max_len) {
 			return kr_error(ERANGE);
 		}
 	} else {
 		/* No subnet, use maximal subnet length. */
-		bit_len = (family == AF_INET6) ? 128 : 32;
+		bit_len = max_len;
 	}
 	/* Parse address */
 	int ret = inet_pton(family, addr_str, dst);
@@ -550,6 +703,22 @@ int kr_bitcmp(const char *a, const char *b, int bits)
 		ret = ((uint8_t)(*a >> shift) - (uint8_t)(*b >> shift));
 	}
 	return ret;
+}
+
+void kr_bitmask(unsigned char *a, size_t a_len, int bits)
+{
+	if (bits < 0 || !a || !a_len) {
+		return;
+	}
+
+	size_t i = bits / 8;
+	const size_t mid_bits = 8 - (bits % 8);
+	const unsigned char mask = 0xFF << mid_bits;
+	if (i < a_len)
+		a[i] &= mask;
+
+	for (++i; i < a_len; ++i)
+		a[i] = 0;
 }
 
 int kr_rrkey(char *key, uint16_t class, const knot_dname_t *owner,
@@ -713,7 +882,10 @@ int kr_ranked_rrarray_add(ranked_rr_array_t *array, const knot_rrset_t *rr,
 		return kr_error(ENOMEM);
 	}
 	rr_new->rrs = rr->rrs;
-	if (kr_fails_assert(rr_new->additional == NULL)) return kr_error(EINVAL);
+	if (kr_fails_assert(rr_new->additional == NULL)) {
+		mm_free(pool, entry);
+		return kr_error(EINVAL);
+	}
 
 	entry->qry_uid = qry_uid;
 	entry->rr = rr_new;
@@ -1150,7 +1322,11 @@ void kr_rrset_init(knot_rrset_t *rrset, knot_dname_t *owner,
 	if (kr_fails_assert(rrset)) return;
 	knot_rrset_init(rrset, owner, type, rclass, ttl);
 }
-uint16_t kr_pkt_has_dnssec(const knot_pkt_t *pkt)
+bool kr_pkt_has_wire(const knot_pkt_t *pkt)
+{
+	return pkt->size != KR_PKT_SIZE_NOWIRE;
+}
+bool kr_pkt_has_dnssec(const knot_pkt_t *pkt)
 {
 	return knot_pkt_has_dnssec(pkt);
 }

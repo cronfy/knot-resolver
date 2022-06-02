@@ -10,6 +10,7 @@
 #include <stdbool.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/un.h>
 #include <netinet/in.h>
 #include <unistd.h>
 
@@ -27,6 +28,19 @@
 #include "lib/defines.h"
 #include "lib/generic/array.h"
 #include "lib/log.h"
+
+/** When knot_pkt is passed from cache without ->wire, this is the ->size. */
+static const size_t KR_PKT_SIZE_NOWIRE = -1;
+
+/** Maximum length (excluding null-terminator) of a presentation-form address
+ * returned by `kr_straddr`. */
+#define KR_STRADDR_MAXLEN 109
+
+/** Used for reserving enough space for the `kr_sockaddr_key` function
+ * output. */
+struct kr_sockaddr_key_storage {
+	char bytes[sizeof(struct sockaddr_storage)];
+};
 
 
 /*
@@ -240,6 +254,13 @@ union kr_sockaddr {
 	struct sockaddr_in6 ip6;
 };
 
+/** Simple storage for IPx addresses. */
+union kr_in_addr {
+	struct in_addr ip4;
+	struct in6_addr ip6;
+};
+
+/* TODO: rename kr_inaddr functions to kr_sockaddr */
 /** Address bytes for given family. */
 KR_EXPORT KR_PURE
 const char *kr_inaddr(const struct sockaddr *addr);
@@ -252,6 +273,27 @@ int kr_inaddr_len(const struct sockaddr *addr);
 /** Sockaddr length for given family, i.e. sizeof(struct sockaddr_in*). */
 KR_EXPORT KR_PURE
 int kr_sockaddr_len(const struct sockaddr *addr);
+
+/** Creates a packed structure from the specified `addr`, safe for use as a key
+ * in containers like `trie_t`, and writes it into `dst`. On success, returns
+ * the actual length of the key.
+ *
+ * Returns `kr_error(EAFNOSUPPORT)` if the family of `addr` is unsupported. */
+KR_EXPORT
+ssize_t kr_sockaddr_key(struct kr_sockaddr_key_storage *dst,
+                        const struct sockaddr *addr);
+
+/** Creates a `struct sockaddr` from the specified `key` created using the
+ * `kr_sockaddr_key()` function. */
+KR_EXPORT
+struct sockaddr *kr_sockaddr_from_key(struct sockaddr_storage *dst,
+                                      const char *key);
+
+/** Checks whether the two keys represent the same address;
+ * does NOT compare the ports. */
+KR_EXPORT
+bool kr_sockaddr_key_same_addr(const char *key_a, const char *key_b);
+
 /** Compare two given sockaddr.
  * return 0 - addresses are equal, error code otherwise.
  */
@@ -284,8 +326,12 @@ static inline char *kr_straddr(const struct sockaddr *addr)
 {
 	if (kr_fails_assert(addr)) return NULL;
 	/* We are the single-threaded application */
-	static char str[INET6_ADDRSTRLEN + 1 + 5 + 1];
-	size_t len = sizeof(str);
+	static char str[KR_STRADDR_MAXLEN + 1] = {0};
+	if (addr->sa_family == AF_UNIX) {
+		strncpy(str, ((struct sockaddr_un *) addr)->sun_path, sizeof(str) - 1);
+		return str;
+	}
+	size_t len = KR_STRADDR_MAXLEN;
 	int ret = kr_inaddr_str(addr, str, &len);
 	return ret != kr_ok() || len == 0 ? NULL : str;
 }
@@ -336,6 +382,25 @@ int kr_straddr_join(const char *addr, uint16_t port, char *buf, size_t *buflen);
  *  so this is e.g. suitable for comparing IP prefixes. */
 KR_EXPORT KR_PURE
 int kr_bitcmp(const char *a, const char *b, int bits);
+
+/** Masks bits. The specified number of bits in `a` from the left (network order)
+ * will remain their original value, while the rest will be set to zero.
+ * This is useful for storing network addresses in a trie. */
+KR_EXPORT
+void kr_bitmask(unsigned char *a, size_t a_len, int bits);
+
+/** Check whether `addr` points to an `AF_INET6` address and whether the address
+ * is link-local. */
+static inline bool kr_sockaddr_link_local(const struct sockaddr *addr)
+{
+	if (addr->sa_family != AF_INET6)
+		return false;
+
+	/* Link-local: https://tools.ietf.org/html/rfc4291#section-2.4 */
+	const uint8_t prefix[] = { 0xFE, 0x80 };
+	const struct sockaddr_in6 *ip6 = (const struct sockaddr_in6 *) addr;
+	return kr_bitcmp((char *) ip6->sin6_addr.s6_addr, (char *) prefix, 10) == 0;
+}
 
 /** @internal RR map flags. */
 static const uint8_t KEY_FLAG_RRSIG = 0x02;
@@ -531,7 +596,8 @@ const char *kr_strptime_diff(const char *format, const char *time1_str,
 /* Trivial non-inline wrappers, to be used in lua. */
 KR_EXPORT void kr_rrset_init(knot_rrset_t *rrset, knot_dname_t *owner,
 				uint16_t type, uint16_t rclass, uint32_t ttl);
-KR_EXPORT uint16_t kr_pkt_has_dnssec(const knot_pkt_t *pkt);
+KR_EXPORT bool kr_pkt_has_wire(const knot_pkt_t *pkt);
+KR_EXPORT bool kr_pkt_has_dnssec(const knot_pkt_t *pkt);
 KR_EXPORT uint16_t kr_pkt_qclass(const knot_pkt_t *pkt);
 KR_EXPORT uint16_t kr_pkt_qtype(const knot_pkt_t *pkt);
 KR_EXPORT uint32_t kr_rrsig_sig_inception(const knot_rdata_t *rdata);

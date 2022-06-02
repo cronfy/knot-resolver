@@ -7,7 +7,6 @@
 #include "daemon/tls.h"
 
 #include "lib/generic/array.h"
-#include "lib/generic/map.h"
 #include "lib/generic/trie.h"
 
 #include <uv.h>
@@ -30,6 +29,8 @@ typedef struct {
 	bool freebind;    /**< used for binding to non-local address */
 	const char *kind; /**< tag for other types: "control" or module-handled kinds */
 } endpoint_flags_t;
+
+struct endpoint_key;
 
 static inline bool endpoint_flags_eq(endpoint_flags_t f1, endpoint_flags_t f2)
 {
@@ -68,20 +69,35 @@ struct net_tcp_param {
 	uint64_t tls_handshake_timeout;
 };
 
+/** Information about an address that is allowed to use PROXYv2. */
+struct net_proxy_data {
+	union kr_in_addr addr;
+	uint8_t netmask;   /**< Number of bits to be matched */
+};
+
 struct network {
 	uv_loop_t *loop;
 
 	/** Map: address string -> endpoint_array_t.
-	 * \note even same address-port-flags tuples may appear.
-	 * TODO: trie_t, keyed on *binary* address-port pair. */
-	map_t endpoints;
+	 * \note even same address-port-flags tuples may appear. */
+	trie_t *endpoints;
 
 	/** Registry of callbacks for special endpoint kinds (for opening/closing).
 	 * Map: kind (lowercased) -> lua function ID converted to void *
 	 * The ID is the usual: raw int index in the LUA_REGISTRYINDEX table. */
 	trie_t *endpoint_kinds;
 	/** See network_engage_endpoints() */
-	bool missing_kind_is_error;
+	bool missing_kind_is_error : 1;
+
+	/** True: All IPv4 addresses are allowed to use the PROXYv2 protocol */
+	bool proxy_all4 : 1;
+	/** True: All IPv6 addresses are allowed to use the PROXYv2 protocol */
+	bool proxy_all6 : 1;
+
+	/** IPv4 addresses and networks allowed to use the PROXYv2 protocol */
+	trie_t *proxy_addrs4;
+	/** IPv6 addresses and networks allowed to use the PROXYv2 protocol */
+	trie_t *proxy_addrs6;
 
 	struct tls_credentials *tls_credentials;
 	tls_client_params_t *tls_client_params; /**< Use tls_client_params_*() functions. */
@@ -105,6 +121,17 @@ void network_deinit(struct network *net);
 int network_listen(struct network *net, const char *addr, uint16_t port,
 		   int16_t nic_queue, endpoint_flags_t flags);
 
+/** Allow the specified address to send the PROXYv2 header.
+ * \note the address may be specified with a netmask
+ */
+int network_proxy_allow(struct network *net, const char* addr);
+
+/** Reset all addresses allowed to send the PROXYv2 header. No addresses will
+ * be allowed to send PROXYv2 headers from the point of calling this function
+ * until re-allowed via network_proxy_allow again.
+ */
+void network_proxy_reset(struct network *net);
+
 /** Start listening on an open file-descriptor.
  * \note flags.sock_type isn't meaningful here.
  * \note ownership of flags.* is taken on success.  TODO: non-success?
@@ -122,6 +149,11 @@ void network_close_force(struct network *net);
 /** Enforce that all endpoints are registered from now on.
  * This only does anything with struct endpoint::flags.kind != NULL. */
 int network_engage_endpoints(struct network *net);
+
+/** Returns a string representation of the specified endpoint key.
+ *
+ * The result points into key or is on static storage like for kr_straddr() */
+const char *network_endpoint_key_str(const struct endpoint_key *key);
 
 int network_set_tls_cert(struct network *net, const char *cert);
 int network_set_tls_key(struct network *net, const char *key);

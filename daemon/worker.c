@@ -27,6 +27,7 @@
 #include "daemon/bindings/api.h"
 #include "daemon/engine.h"
 #include "daemon/io.h"
+#include "daemon/proxyv2.h"
 #include "daemon/session.h"
 #include "daemon/tls.h"
 #include "daemon/http.h"
@@ -65,6 +66,8 @@ struct request_ctx
 		struct session *session;
 		/** Requestor's address; separate because of UDP session "sharing". */
 		union kr_sockaddr addr;
+		/** Request communication address; if not from a proxy, same as addr. */
+		union kr_sockaddr comm_addr;
 		/** Local address.  For AF_XDP we couldn't use session's,
 		 * as the address might be different every time. */
 		union kr_sockaddr dst_addr;
@@ -103,11 +106,6 @@ struct qr_task
 		if ((task) && --(task)->refs == 0) \
 			qr_task_free((task)); \
 	} while (0)
-
-/** @internal get key for tcp session
- *  @note kr_straddr() return pointer to static string
- */
-#define tcpsess_key(addr) kr_straddr(addr)
 
 /* Forward decls */
 static void qr_task_free(struct qr_task *task);
@@ -277,7 +275,7 @@ static uint8_t *alloc_wire_cb(struct kr_request *req, uint16_t *maxlen)
 		return NULL;
 	xdp_handle_data_t *xhd = handle->data;
 	knot_xdp_msg_t out;
-	bool ipv6 = ctx->source.addr.ip.sa_family == AF_INET6;
+	bool ipv6 = ctx->source.comm_addr.ip.sa_family == AF_INET6;
 	int ret = knot_xdp_send_alloc(xhd->socket,
 			#if KNOT_VERSION_HEX >= 0x030100
 					ipv6 ? KNOT_XDP_MSG_IPV6 : 0, &out);
@@ -290,9 +288,11 @@ static uint8_t *alloc_wire_cb(struct kr_request *req, uint16_t *maxlen)
 		return NULL;
 	}
 	*maxlen = MIN(*maxlen, out.payload.iov_len);
+#if KNOT_VERSION_HEX < 0x030100
 	/* It's most convenient to fill the MAC addresses at this point. */
 	memcpy(out.eth_from, &ctx->source.eth_addrs[0], 6);
 	memcpy(out.eth_to,   &ctx->source.eth_addrs[1], 6);
+#endif
 	return out.payload.iov_base;
 }
 static void free_wire(const struct request_ctx *ctx)
@@ -313,8 +313,13 @@ static void free_wire(const struct request_ctx *ctx)
 	knot_xdp_msg_t out;
 	out.payload.iov_base = ans->wire;
 	out.payload.iov_len = 0;
-	uint32_t sent;
+	uint32_t sent = 0;
+#if KNOT_VERSION_HEX >= 0x030100
+	int ret = 0;
+	knot_xdp_send_free(xhd->socket, &out, 1);
+#else
 	int ret = knot_xdp_send(xhd->socket, &out, 1, &sent);
+#endif
 	kr_assert(ret == KNOT_EOK && sent == 0);
 	kr_log_debug(XDP, "freed unsent buffer, ret = %d\n", ret);
 }
@@ -339,12 +344,11 @@ static inline bool is_tcp_waiting(struct sockaddr *address) {
  * in case the request didn't come from network.
  */
 static struct request_ctx *request_create(struct worker_ctx *worker,
-					  struct session *session,
-					  const struct sockaddr *addr,
-					  const struct sockaddr *dst_addr,
-					  const uint8_t *eth_from,
-					  const uint8_t *eth_to,
-					  uint32_t uid)
+                                          struct session *session,
+                                          struct io_comm_data *comm,
+                                          const uint8_t *eth_from,
+                                          const uint8_t *eth_to,
+                                          uint32_t uid)
 {
 	knot_mm_t pool = {
 		.ctx = pool_borrow(worker),
@@ -390,16 +394,30 @@ static struct request_ctx *request_create(struct worker_ctx *worker,
 	req->pool = pool;
 	req->vars_ref = LUA_NOREF;
 	req->uid = uid;
-	req->qsource.flags.xdp = is_xdp;
+	req->qsource.comm_flags.xdp = is_xdp;
 	kr_request_set_extended_error(req, KNOT_EDNS_EDE_NONE, NULL);
 	array_init(req->qsource.headers);
 	if (session) {
-		req->qsource.flags.tcp = session_get_handle(session)->type == UV_TCP;
-		req->qsource.flags.tls = session_flags(session)->has_tls;
-		req->qsource.flags.http = session_flags(session)->has_http;
+		kr_require(comm);
+
+		const struct sockaddr *src_addr = comm->src_addr;
+		const struct sockaddr *comm_addr = comm->comm_addr;
+		const struct sockaddr *dst_addr = comm->dst_addr;
+		const struct proxy_result *proxy = comm->proxy;
+
+		req->qsource.comm_flags.tcp = session_get_handle(session)->type == UV_TCP;
+		req->qsource.comm_flags.tls = session_flags(session)->has_tls;
+		req->qsource.comm_flags.http = session_flags(session)->has_http;
+
+		req->qsource.flags = req->qsource.comm_flags;
+		if (proxy) {
+			req->qsource.flags.tcp = proxy->protocol == SOCK_STREAM;
+			req->qsource.flags.tls = proxy->has_tls;
+		}
+
 		req->qsource.stream_id = -1;
 #if ENABLE_DOH2
-		if (req->qsource.flags.http) {
+		if (req->qsource.comm_flags.http) {
 			struct http_ctx *http_ctx = session_http_get_server_ctx(session);
 			struct http_stream stream = queue_head(http_ctx->streams);
 			req->qsource.stream_id = stream.id;
@@ -411,8 +429,14 @@ static struct request_ctx *request_create(struct worker_ctx *worker,
 		}
 #endif
 		/* We need to store a copy of peer address. */
-		memcpy(&ctx->source.addr.ip, addr, kr_sockaddr_len(addr));
+		memcpy(&ctx->source.addr.ip, src_addr, kr_sockaddr_len(src_addr));
 		req->qsource.addr = &ctx->source.addr.ip;
+
+		if (!comm_addr)
+			comm_addr = src_addr;
+		memcpy(&ctx->source.comm_addr.ip, comm_addr, kr_sockaddr_len(comm_addr));
+		req->qsource.comm_addr = &ctx->source.comm_addr.ip;
+
 		if (!dst_addr) /* We wouldn't have to copy in this case, but for consistency. */
 			dst_addr = session_get_sockname(session);
 		memcpy(&ctx->source.dst_addr.ip, dst_addr, kr_sockaddr_len(dst_addr));
@@ -722,13 +746,6 @@ static int qr_task_send(struct qr_task *task, struct session *session,
 		worker_task_pkt_set_msgid(task, msg_id);
 	}
 
-	uv_handle_t *ioreq = malloc(is_stream ? sizeof(uv_write_t) : sizeof(uv_udp_send_t));
-	if (!ioreq)
-		return qr_task_on_send(task, handle, kr_error(ENOMEM));
-
-	/* Pending ioreq on current task */
-	qr_task_ref(task);
-
 	struct worker_ctx *worker = ctx->worker;
 	/* Note time for upstream RTT */
 	task->send_time = kr_now();
@@ -736,6 +753,14 @@ static int qr_task_send(struct qr_task *task, struct session *session,
 	/* Send using given protocol */
 	if (kr_fails_assert(!session_flags(session)->closing))
 		return qr_task_on_send(task, NULL, kr_error(EIO));
+
+	uv_handle_t *ioreq = malloc(is_stream ? sizeof(uv_write_t) : sizeof(uv_udp_send_t));
+	if (!ioreq)
+		return qr_task_on_send(task, handle, kr_error(ENOMEM));
+
+	/* Pending ioreq on current task */
+	qr_task_ref(task);
+
 	if (session_flags(session)->has_http) {
 #if ENABLE_DOH2
 		uv_write_t *write_req = (uv_write_t *)ioreq;
@@ -858,9 +883,12 @@ static int session_tls_hs_cb(struct session *session, int status)
 			 * So that it MUST be unsuccessful rehandshake.
 			 * Check it. */
 			kr_require(deletion_res != 0);
-			const char *key = tcpsess_key(peer);
-			kr_require(key);
-			kr_require(map_contains(&the_worker->tcp_connected, key) != 0);
+			struct kr_sockaddr_key_storage key;
+			ssize_t keylen = kr_sockaddr_key(&key, peer);
+			if (keylen < 0)
+				return keylen;
+			trie_val_t *val;
+			kr_require((val = trie_get_try(the_worker->tcp_connected, key.bytes, keylen)) && *val);
 		}
 #endif
 		return ret;
@@ -1181,6 +1209,7 @@ static uv_handle_t *transmit(struct qr_task *task)
 		struct session *session = ret->data;
 		struct sockaddr *peer = session_get_peer(session);
 		kr_assert(peer->sa_family == AF_UNSPEC && session_flags(session)->outgoing);
+		kr_require(addr->sa_family == AF_INET || addr->sa_family == AF_INET6);
 		memcpy(peer, addr, kr_sockaddr_len(addr));
 		if (qr_task_send(task, session, (struct sockaddr *)choice,
 				 task->pktbuf) != 0) {
@@ -1301,8 +1330,17 @@ static int xdp_push(struct qr_task *task, const uv_handle_t *src_handle)
 		return qr_task_on_send(task, src_handle, kr_error(EINVAL));
 
 	knot_xdp_msg_t msg;
+#if KNOT_VERSION_HEX >= 0x030100
+	/* We don't have a nice way of preserving the _msg_t from frame allocation,
+	 * so we manually redo all other parts of knot_xdp_send_alloc() */
+	memset(&msg, 0, sizeof(msg));
+	bool ipv6 = ctx->source.addr.ip.sa_family == AF_INET6;
+	msg.flags = ipv6 ? KNOT_XDP_MSG_IPV6 : 0;
+	memcpy(msg.eth_from, &ctx->source.eth_addrs[0], 6);
+	memcpy(msg.eth_to,   &ctx->source.eth_addrs[1], 6);
+#endif
 	const struct sockaddr *ip_from = &ctx->source.dst_addr.ip;
-	const struct sockaddr *ip_to   = &ctx->source.addr.ip;
+	const struct sockaddr *ip_to   = &ctx->source.comm_addr.ip;
 	memcpy(&msg.ip_from, ip_from, kr_sockaddr_len(ip_from));
 	memcpy(&msg.ip_to,   ip_to,   kr_sockaddr_len(ip_to));
 	msg.payload.iov_base = ctx->req.answer->wire;
@@ -1338,7 +1376,11 @@ static int qr_task_finalize(struct qr_task *task, int state)
 		return state == KR_STATE_DONE ? kr_ok() : kr_error(EIO);
 	}
 
-	if (unlikely(ctx->req.answer == NULL)) { /* meant to be dropped */
+	/* meant to be dropped */
+	if (unlikely(ctx->req.answer == NULL || ctx->req.options.NO_ANSWER)) {
+		/* For NO_ANSWER, a well-behaved layer should set the state to FAIL */
+		kr_assert(!ctx->req.options.NO_ANSWER || (ctx->req.state & KR_STATE_FAIL));
+
 		(void) qr_task_on_send(task, NULL, kr_ok());
 		return kr_ok();
 	}
@@ -1366,7 +1408,7 @@ static int qr_task_finalize(struct qr_task *task, int state)
 		else
 			kr_assert(false);
 	} else {
-		ret = qr_task_send(task, source_session, &ctx->source.addr.ip, ctx->req.answer);
+		ret = qr_task_send(task, source_session, &ctx->source.comm_addr.ip, ctx->req.answer);
 	}
 
 	if (ret != kr_ok()) {
@@ -1718,9 +1760,8 @@ static int parse_packet(knot_pkt_t *query)
 	return ret;
 }
 
-int worker_submit(struct session *session,
-		  const struct sockaddr *peer, const struct sockaddr *dst_addr,
-		  const uint8_t *eth_from, const uint8_t *eth_to, knot_pkt_t *pkt)
+int worker_submit(struct session *session, struct io_comm_data *comm,
+                  const uint8_t *eth_from, const uint8_t *eth_to, knot_pkt_t *pkt)
 {
 	if (!session || !pkt)
 		return kr_error(EINVAL);
@@ -1737,6 +1778,12 @@ int worker_submit(struct session *session,
 	struct http_ctx *http_ctx = NULL;
 #if ENABLE_DOH2
 	http_ctx = session_http_get_server_ctx(session);
+
+	/* Badly formed query when using DoH leads to a Bad Request */
+	if (http_ctx && !is_outgoing && ret) {
+		http_send_status(session, HTTP_STATUS_BAD_REQUEST);
+		return ret;
+	}
 #endif
 
 	if (!is_outgoing && http_ctx && queue_len(http_ctx->streams) <= 0)
@@ -1747,13 +1794,6 @@ int worker_submit(struct session *session,
 	    (is_query == is_outgoing)) {
 		if (!is_outgoing) {
 			the_worker->stats.dropped += 1;
-		#if ENABLE_DOH2
-			if (http_ctx) {
-				struct http_stream stream = queue_head(http_ctx->streams);
-				http_free_headers(stream.headers);
-				queue_pop(http_ctx->streams);
-			}
-		#endif
 		}
 		return kr_error(EILSEQ);
 	}
@@ -1764,8 +1804,8 @@ int worker_submit(struct session *session,
 	const struct sockaddr *addr = NULL;
 	if (!is_outgoing) { /* request from a client */
 		struct request_ctx *ctx =
-			request_create(the_worker, session, peer, dst_addr,
-					eth_from, eth_to, knot_wire_get_id(pkt->wire));
+			request_create(the_worker, session, comm, eth_from,
+			               eth_to, knot_wire_get_id(pkt->wire));
 		if (http_ctx)
 			queue_pop(http_ctx->streams);
 		if (!ctx)
@@ -1796,7 +1836,7 @@ int worker_submit(struct session *session,
 		}
 		if (kr_fails_assert(!session_flags(session)->closing))
 			return kr_error(EINVAL);
-		addr = peer;
+		addr = (comm) ? comm->src_addr : NULL;
 		/* Note receive time for RTT calculation */
 		task->recv_time = kr_now();
 	}
@@ -1811,77 +1851,83 @@ int worker_submit(struct session *session,
 	return qr_task_step(task, addr, pkt);
 }
 
-static int map_add_tcp_session(map_t *map, const struct sockaddr* addr,
-			       struct session *session)
+static int trie_add_tcp_session(trie_t *trie, const struct sockaddr *addr,
+                                struct session *session)
 {
-	if (kr_fails_assert(map && addr))
+	if (kr_fails_assert(trie && addr))
 		return kr_error(EINVAL);
-	const char *key = tcpsess_key(addr);
-	if (kr_fails_assert(key && map_contains(map, key) == 0))
+	struct kr_sockaddr_key_storage key;
+	ssize_t keylen = kr_sockaddr_key(&key, addr);
+	if (keylen < 0)
+		return keylen;
+	trie_val_t *val = trie_get_ins(trie, key.bytes, keylen);
+	if (kr_fails_assert(*val == NULL))
 		return kr_error(EINVAL);
-	int ret = map_set(map, key, session);
-	return ret ? kr_error(EINVAL) : kr_ok();
+	*val = session;
+	return kr_ok();
 }
 
-static int map_del_tcp_session(map_t *map, const struct sockaddr* addr)
+static int trie_del_tcp_session(trie_t *trie, const struct sockaddr *addr)
 {
-	if (kr_fails_assert(map && addr))
+	if (kr_fails_assert(trie && addr))
 		return kr_error(EINVAL);
-	const char *key = tcpsess_key(addr);
-	if (kr_fails_assert(key))
-		return kr_error(EINVAL);
-	int ret = map_del(map, key);
+	struct kr_sockaddr_key_storage key;
+	ssize_t keylen = kr_sockaddr_key(&key, addr);
+	if (keylen < 0)
+		return keylen;
+	int ret = trie_del(trie, key.bytes, keylen, NULL);
 	return ret ? kr_error(ENOENT) : kr_ok();
 }
 
-static struct session* map_find_tcp_session(map_t *map,
-					    const struct sockaddr *addr)
+static struct session *trie_find_tcp_session(trie_t *trie,
+                                             const struct sockaddr *addr)
 {
-	if (kr_fails_assert(map && addr))
+	if (kr_fails_assert(trie && addr))
 		return NULL;
-	const char *key = tcpsess_key(addr);
-	if (kr_fails_assert(key))
+	struct kr_sockaddr_key_storage key;
+	ssize_t keylen = kr_sockaddr_key(&key, addr);
+	if (keylen < 0)
 		return NULL;
-	struct session* ret = map_get(map, key);
-	return ret;
+	trie_val_t *val = trie_get_try(trie, key.bytes, keylen);
+	return val ? *val : NULL;
 }
 
 int worker_add_tcp_connected(struct worker_ctx *worker,
 				    const struct sockaddr* addr,
 				    struct session *session)
 {
-	return map_add_tcp_session(&worker->tcp_connected, addr, session);
+	return trie_add_tcp_session(worker->tcp_connected, addr, session);
 }
 
 int worker_del_tcp_connected(struct worker_ctx *worker,
 				    const struct sockaddr* addr)
 {
-	return map_del_tcp_session(&worker->tcp_connected, addr);
+	return trie_del_tcp_session(worker->tcp_connected, addr);
 }
 
 struct session* worker_find_tcp_connected(struct worker_ctx *worker,
 						 const struct sockaddr* addr)
 {
-	return map_find_tcp_session(&worker->tcp_connected, addr);
+	return trie_find_tcp_session(worker->tcp_connected, addr);
 }
 
 static int worker_add_tcp_waiting(struct worker_ctx *worker,
 				  const struct sockaddr* addr,
 				  struct session *session)
 {
-	return map_add_tcp_session(&worker->tcp_waiting, addr, session);
+	return trie_add_tcp_session(worker->tcp_waiting, addr, session);
 }
 
 int worker_del_tcp_waiting(struct worker_ctx *worker,
 			   const struct sockaddr* addr)
 {
-	return map_del_tcp_session(&worker->tcp_waiting, addr);
+	return trie_del_tcp_session(worker->tcp_waiting, addr);
 }
 
 struct session* worker_find_tcp_waiting(struct worker_ctx *worker,
 					       const struct sockaddr* addr)
 {
-	return map_find_tcp_session(&worker->tcp_waiting, addr);
+	return trie_find_tcp_session(worker->tcp_waiting, addr);
 }
 
 int worker_end_tcp(struct session *session)
@@ -2004,8 +2050,8 @@ struct qr_task *worker_resolve_start(knot_pkt_t *query, struct kr_qflags options
 		return NULL;
 
 
-	struct request_ctx *ctx = request_create(worker, NULL, NULL, NULL, NULL, NULL,
-						 worker->next_request_uid);
+	struct request_ctx *ctx = request_create(worker, NULL, NULL, NULL, NULL,
+	                                         worker->next_request_uid);
 	if (!ctx)
 		return NULL;
 
@@ -2137,8 +2183,8 @@ bool worker_task_finished(struct qr_task *task)
 /** Reserve worker buffers.  We assume worker's been zeroed. */
 static int worker_reserve(struct worker_ctx *worker, size_t ring_maxlen)
 {
-	worker->tcp_connected = map_make(NULL);
-	worker->tcp_waiting = map_make(NULL);
+	worker->tcp_connected = trie_create(NULL);
+	worker->tcp_waiting = trie_create(NULL);
 	worker->subreq_out = trie_create(NULL);
 
 	array_init(worker->pool_mp);
@@ -2166,8 +2212,8 @@ void worker_deinit(void)
 	struct worker_ctx *worker = the_worker;
 	if (kr_fails_assert(worker))
 		return;
-	map_clear(&worker->tcp_connected);
-	map_clear(&worker->tcp_waiting);
+	trie_free(worker->tcp_connected);
+	trie_free(worker->tcp_waiting);
 	trie_free(worker->subreq_out);
 	worker->subreq_out = NULL;
 

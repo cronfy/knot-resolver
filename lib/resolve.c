@@ -346,6 +346,19 @@ static int edns_erase_and_reserve(knot_pkt_t *pkt)
 	return knot_pkt_reserve(pkt, len);
 }
 
+static inline size_t edns_padding_option_size(int32_t tls_padding)
+{
+	if (tls_padding == -1)
+		/* FIXME: we do not know how to reserve space for the
+		 * default padding policy, since we can't predict what
+		 * it will select. So i'm just guessing :/ */
+		return KNOT_EDNS_OPTION_HDRLEN + 512;
+	if (tls_padding >= 2)
+		return KNOT_EDNS_OPTION_HDRLEN + tls_padding;
+
+	return 0;
+}
+
 static int edns_create(knot_pkt_t *pkt, const struct kr_request *req)
 {
 	pkt->opt_rr = knot_rrset_copy(req->ctx->upstream_opt_rr, &pkt->mm);
@@ -356,14 +369,8 @@ static int edns_create(knot_pkt_t *pkt, const struct kr_request *req)
 		wire_size += KR_COOKIE_OPT_MAX_LEN;
 	}
 #endif /* ENABLE_COOKIES */
-	if (req->qsource.flags.tls) {
-		if (req->ctx->tls_padding == -1)
-			/* FIXME: we do not know how to reserve space for the
-			 * default padding policy, since we can't predict what
-			 * it will select. So i'm just guessing :/ */
-			wire_size += KNOT_EDNS_OPTION_HDRLEN + 512;
-		if (req->ctx->tls_padding >= 2)
-			wire_size += KNOT_EDNS_OPTION_HDRLEN + req->ctx->tls_padding;
+	if (req->qsource.flags.tls || req->qsource.comm_flags.tls) {
+		wire_size += edns_padding_option_size(req->ctx->tls_padding);
 	}
 	return knot_pkt_reserve(pkt, wire_size);
 }
@@ -417,26 +424,17 @@ static int write_extra_ranked_records(const ranked_rr_array_t *arr, uint16_t reo
 	return err;
 }
 
-/** @internal Add an EDNS padding RR into the answer if requested and required. */
-static int answer_padding(struct kr_request *request)
+static int pkt_padding(knot_pkt_t *packet, int32_t padding)
 {
-	if (kr_fails_assert(request && request->answer && request->ctx))
-		return kr_error(EINVAL);
-	if (!request->qsource.flags.tls) {
-		/* Not meaningful to pad without encryption. */
-		return kr_ok();
-	}
-	int32_t padding = request->ctx->tls_padding;
-	knot_pkt_t *answer = request->answer;
-	knot_rrset_t *opt_rr = answer->opt_rr;
+	knot_rrset_t *opt_rr = packet->opt_rr;
 	int32_t pad_bytes = -1;
 
 	if (padding == -1) { /* use the default padding policy from libknot */
-		pad_bytes =  knot_pkt_default_padding_size(answer, opt_rr);
+		pad_bytes =  knot_pkt_default_padding_size(packet, opt_rr);
 	}
 	if (padding >= 2) {
-		int32_t max_pad_bytes = knot_edns_get_payload(opt_rr) - (answer->size + knot_rrset_size(opt_rr));
-		pad_bytes = MIN(knot_edns_alignment_size(answer->size, knot_rrset_size(opt_rr), padding),
+		int32_t max_pad_bytes = knot_edns_get_payload(opt_rr) - (packet->size + knot_rrset_size(opt_rr));
+		pad_bytes = MIN(knot_edns_alignment_size(packet->size, knot_rrset_size(opt_rr), padding),
 				max_pad_bytes);
 	}
 
@@ -444,13 +442,25 @@ static int answer_padding(struct kr_request *request)
 		uint8_t zeros[MAX(1, pad_bytes)];
 		memset(zeros, 0, sizeof(zeros));
 		int r = knot_edns_add_option(opt_rr, KNOT_EDNS_OPTION_PADDING,
-					     pad_bytes, zeros, &answer->mm);
+					     pad_bytes, zeros, &packet->mm);
 		if (r != KNOT_EOK) {
-			knot_rrset_clear(opt_rr, &answer->mm);
+			knot_rrset_clear(opt_rr, &packet->mm);
 			return kr_error(r);
 		}
 	}
 	return kr_ok();
+}
+
+/** @internal Add an EDNS padding RR into the answer if requested and required. */
+static int answer_padding(struct kr_request *request)
+{
+	if (kr_fails_assert(request && request->answer && request->ctx))
+		return kr_error(EINVAL);
+	if (!request->qsource.flags.tls && !request->qsource.comm_flags.tls) {
+		/* Not meaningful to pad without encryption. */
+		return kr_ok();
+	}
+	return pkt_padding(request->answer, request->ctx->tls_padding);
 }
 
 /* Make a clean SERVFAIL answer. */
@@ -538,27 +548,26 @@ static void answer_finalize(struct kr_request *request)
 	/* AD flag.  We can only change `secure` from true to false.
 	 * Be conservative.  Primary approach: check ranks of all RRs in wire.
 	 * Only "negative answers" need special handling. */
-	bool secure = last != NULL && request->state == KR_STATE_DONE /*< suspicious otherwise */
+	bool secure = request->state == KR_STATE_DONE /*< suspicious otherwise */
 		&& knot_pkt_qtype(answer) != KNOT_RRTYPE_RRSIG;
-	if (last && (last->flags.STUB)) {
+	if (last->flags.STUB) {
 		secure = false; /* don't trust forwarding for now */
 	}
-	if (last && (last->flags.DNSSEC_OPTOUT)) {
+	if (last->flags.DNSSEC_OPTOUT) {
 		VERBOSE_MSG(last, "insecure because of opt-out\n");
 		secure = false; /* the last answer is insecure due to opt-out */
 	}
 
 	/* Write all RRsets meant for the answer. */
-	const uint16_t reorder = last ? last->reorder : 0;
 	bool answ_all_cnames = false/*arbitrary*/;
 	if (knot_pkt_begin(answer, KNOT_ANSWER)
-	    || write_extra_ranked_records(&request->answ_selected, reorder,
+	    || write_extra_ranked_records(&request->answ_selected, last->reorder,
 					answer, &secure, &answ_all_cnames)
 	    || knot_pkt_begin(answer, KNOT_AUTHORITY)
-	    || write_extra_ranked_records(&request->auth_selected, reorder,
+	    || write_extra_ranked_records(&request->auth_selected, last->reorder,
 					answer, &secure, NULL)
 	    || knot_pkt_begin(answer, KNOT_ADDITIONAL)
-	    || write_extra_ranked_records(&request->add_selected, reorder,
+	    || write_extra_ranked_records(&request->add_selected, last->reorder,
 					answer, NULL/*not relevant to AD*/, NULL)
 	    || answer_append_edns(request)
 	   )
@@ -567,7 +576,6 @@ static void answer_finalize(struct kr_request *request)
 		return;
 	}
 
-	if (!last) secure = false; /*< should be no-op, mostly documentation */
 	/* AD: "negative answers" need more handling. */
 	if (kr_response_classify(answer) != PKT_NOERROR
 	    /* Additionally check for CNAME chains that "end in NODATA",
@@ -722,6 +730,10 @@ knot_rrset_t* kr_request_ensure_edns(struct kr_request *request)
 
 knot_pkt_t *kr_request_ensure_answer(struct kr_request *request)
 {
+	if (request->options.NO_ANSWER) {
+		kr_assert(request->state & KR_STATE_FAIL);
+		return NULL;
+	}
 	if (request->answer)
 		return request->answer;
 
@@ -731,9 +743,10 @@ knot_pkt_t *kr_request_ensure_answer(struct kr_request *request)
 	// Find answer_max: limit on DNS wire length.
 	uint16_t answer_max;
 	const struct kr_request_qsource_flags *qs_flags = &request->qsource.flags;
-	if (kr_fails_assert((qs_flags->tls || qs_flags->http) ? qs_flags->tcp : true))
+	const struct kr_request_qsource_flags *qs_cflags = &request->qsource.comm_flags;
+	if (kr_fails_assert(!(qs_flags->tls || qs_cflags->tls || qs_cflags->http) || qs_flags->tcp))
 		goto fail;
-	if (!request->qsource.addr || qs_flags->tcp) {
+	if (!request->qsource.addr || qs_flags->tcp || qs_cflags->tcp) {
 		// not on UDP
 		answer_max = KNOT_WIRE_MAX_PKTSIZE;
 	} else if (knot_pkt_has_edns(qs_pkt)) {
@@ -797,32 +810,31 @@ int kr_resolve_consume(struct kr_request *request, struct kr_transport **transpo
 		return KR_STATE_FAIL;
 	}
 	bool tried_tcp = (qry->flags.TCP);
-	if (!packet || packet->size == 0) {
+	if (!packet || packet->size == 0)
 		return KR_STATE_PRODUCE;
+
+	/* Packet cleared, derandomize QNAME. */
+	knot_dname_t *qname_raw = knot_pkt_qname(packet);
+	if (qname_raw && qry->secret != 0) {
+		randomized_qname_case(qname_raw, qry->secret);
+	}
+	request->state = KR_STATE_CONSUME;
+	if (qry->flags.CACHED) {
+		ITERATE_LAYERS(request, qry, consume, packet);
 	} else {
-		/* Packet cleared, derandomize QNAME. */
-		knot_dname_t *qname_raw = knot_pkt_qname(packet);
-		if (qname_raw && qry->secret != 0) {
-			randomized_qname_case(qname_raw, qry->secret);
-		}
-		request->state = KR_STATE_CONSUME;
-		if (qry->flags.CACHED) {
-			ITERATE_LAYERS(request, qry, consume, packet);
-		} else {
-			/* Fill in source and latency information. */
-			request->upstream.rtt = kr_now() - qry->timestamp_mono;
-			request->upstream.transport = transport ? *transport : NULL;
-			ITERATE_LAYERS(request, qry, consume, packet);
-			/* Clear temporary information */
-			request->upstream.transport = NULL;
-			request->upstream.rtt = 0;
-		}
+		/* Fill in source and latency information. */
+		request->upstream.rtt = kr_now() - qry->timestamp_mono;
+		request->upstream.transport = transport ? *transport : NULL;
+		ITERATE_LAYERS(request, qry, consume, packet);
+		/* Clear temporary information */
+		request->upstream.transport = NULL;
+		request->upstream.rtt = 0;
 	}
 
 	if (transport && !qry->flags.CACHED) {
 		if (!(request->state & KR_STATE_FAIL)) {
 			/* Do not complete NS address resolution on soft-fail. */
-			const int rcode = packet ? knot_wire_get_rcode(packet->wire) : 0;
+			const int rcode = knot_wire_get_rcode(packet->wire);
 			if (rcode != KNOT_RCODE_SERVFAIL && rcode != KNOT_RCODE_REFUSED) {
 				qry->flags.AWAIT_IPV6 = false;
 				qry->flags.AWAIT_IPV4 = false;
@@ -906,8 +918,8 @@ static struct kr_query *zone_cut_subreq(struct kr_rplan *rplan, struct kr_query 
 static int forward_trust_chain_check(struct kr_request *request, struct kr_query *qry, bool resume)
 {
 	struct kr_rplan *rplan = &request->rplan;
-	map_t *trust_anchors = &request->ctx->trust_anchors;
-	map_t *negative_anchors = &request->ctx->negative_anchors;
+	trie_t *trust_anchors = request->ctx->trust_anchors;
+	trie_t *negative_anchors = request->ctx->negative_anchors;
 
 	if (qry->parent != NULL &&
 	    !(qry->forward_flags.CNAME) &&
@@ -1092,8 +1104,8 @@ static int forward_trust_chain_check(struct kr_request *request, struct kr_query
 static int trust_chain_check(struct kr_request *request, struct kr_query *qry)
 {
 	struct kr_rplan *rplan = &request->rplan;
-	map_t *trust_anchors = &request->ctx->trust_anchors;
-	map_t *negative_anchors = &request->ctx->negative_anchors;
+	trie_t *trust_anchors = request->ctx->trust_anchors;
+	trie_t *negative_anchors = request->ctx->negative_anchors;
 
 	/* Disable DNSSEC if it enters NTA. */
 	if (kr_ta_get(negative_anchors, qry->zone_cut.name)){
@@ -1525,6 +1537,17 @@ int kr_resolve_checkout(struct kr_request *request, const struct sockaddr *src,
 
 	/* Write down OPT unless in safemode */
 	if (!(qry->flags.NO_EDNS)) {
+		/* TLS padding */
+		if (transport->protocol == KR_TRANSPORT_TLS) {
+			size_t padding_size = edns_padding_option_size(request->ctx->tls_padding);
+			ret = knot_pkt_reserve(packet, padding_size);
+			if (ret)
+				return kr_error(EINVAL);
+			ret = pkt_padding(packet, request->ctx->tls_padding);
+			if (ret)
+				return kr_error(EINVAL);
+		}
+
 		ret = edns_put(packet, true);
 		if (ret != 0) {
 			return kr_error(EINVAL);

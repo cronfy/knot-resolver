@@ -4,10 +4,12 @@
 
 #include "daemon/network.h"
 
+#include "contrib/cleanup.h"
 #include "daemon/bindings/impl.h"
 #include "daemon/io.h"
 #include "daemon/tls.h"
 #include "daemon/worker.h"
+#include "lib/utils.h"
 
 #if ENABLE_XDP
 	#include <libknot/xdp/eth.h>
@@ -18,12 +20,53 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+/** Determines the type of `struct endpoint_key`. */
+enum endpoint_key_type
+{
+	ENDPOINT_KEY_SOCKADDR = 1,
+	ENDPOINT_KEY_IFNAME   = 2,
+};
+
+/** Used as a key in the `struct network::endpoints` trie. */
+struct endpoint_key {
+	enum endpoint_key_type type;
+	char data[];
+};
+
+struct __attribute__((packed)) endpoint_key_sockaddr {
+	enum endpoint_key_type type;
+	struct kr_sockaddr_key_storage sa_key;
+};
+
+struct __attribute__((packed)) endpoint_key_ifname {
+	enum endpoint_key_type type;
+	char ifname[128];
+};
+
+/** Used for reserving enough storage for `endpoint_key`. */
+struct endpoint_key_storage {
+	union {
+		enum endpoint_key_type type;
+		struct endpoint_key_sockaddr sa;
+		struct endpoint_key_ifname ifname;
+		char bytes[1]; /* for easier casting */
+	};
+};
+
+static_assert(_Alignof(struct endpoint_key) <= 4, "endpoint_key must be aligned to <=4");
+static_assert(_Alignof(struct endpoint_key_sockaddr) <= 4, "endpoint_key must be aligned to <=4");
+static_assert(_Alignof(struct endpoint_key_ifname) <= 4, "endpoint_key must be aligned to <=4");
+
 void network_init(struct network *net, uv_loop_t *loop, int tcp_backlog)
 {
 	if (net != NULL) {
 		net->loop = loop;
-		net->endpoints = map_make(NULL);
+		net->endpoints = trie_create(NULL);
 		net->endpoint_kinds = trie_create(NULL);
+		net->proxy_all4 = false;
+		net->proxy_all6 = false;
+		net->proxy_addrs4 = trie_create(NULL);
+		net->proxy_addrs6 = trie_create(NULL);
 		net->tls_client_params = NULL;
 		net->tls_session_ticket_ctx = /* unsync. random, by default */
 		tls_session_ticket_ctx_create(loop, NULL, 0);
@@ -73,24 +116,29 @@ static int endpoint_open_lua_cb(struct network *net, struct endpoint *ep,
 	return kr_ok();
 }
 
-static int engage_endpoint_array(const char *key, void *endpoints, void *net)
+static int engage_endpoint_array(const char *b_key, uint32_t key_len, trie_val_t *val, void *net)
 {
-	endpoint_array_t *eps = (endpoint_array_t *)endpoints;
+	const char *log_addr = network_endpoint_key_str((struct endpoint_key *) b_key);
+	if (!log_addr)
+		log_addr = "[unknown]";
+
+	endpoint_array_t *eps = *val;
 	for (int i = 0; i < eps->len; ++i) {
 		struct endpoint *ep = &eps->at[i];
 		const bool match = !ep->engaged && ep->flags.kind;
 		if (!match) continue;
-		int ret = endpoint_open_lua_cb(net, ep, key);
+		int ret = endpoint_open_lua_cb(net, ep, log_addr);
 		if (ret) return ret;
 	}
 	return 0;
 }
+
 int network_engage_endpoints(struct network *net)
 {
 	if (net->missing_kind_is_error)
 		return kr_ok(); /* maybe weird, but let's make it idempotent */
 	net->missing_kind_is_error = true;
-	int ret = map_walk(&net->endpoints, engage_endpoint_array, net);
+	int ret = trie_apply_with_key(net->endpoints, engage_endpoint_array, net);
 	if (ret) {
 		net->missing_kind_is_error = false; /* avoid the same errors when closing */
 		return ret;
@@ -98,6 +146,25 @@ int network_engage_endpoints(struct network *net)
 	return kr_ok();
 }
 
+const char *network_endpoint_key_str(const struct endpoint_key *key)
+{
+	switch (key->type)
+	{
+	case ENDPOINT_KEY_SOCKADDR:;
+		const struct endpoint_key_sockaddr *sa_key =
+			(struct endpoint_key_sockaddr *) key;
+		struct sockaddr_storage sa_storage;
+		struct sockaddr *sa = kr_sockaddr_from_key(&sa_storage, (const char *) &sa_key->sa_key);
+		return kr_straddr(sa);
+	case ENDPOINT_KEY_IFNAME:;
+		const struct endpoint_key_ifname *if_key =
+			(struct endpoint_key_ifname *) key;
+		return if_key->ifname;
+	default:
+		kr_assert(false);
+		return NULL;
+	}
+}
 
 /** Notify the registered function about endpoint about to be closed. */
 static void endpoint_close_lua_cb(struct network *net, struct endpoint *ep)
@@ -169,19 +236,19 @@ static void endpoint_close(struct network *net, struct endpoint *ep, bool force)
 	}
 }
 
-/** Endpoint visitor (see @file map.h) */
-static int close_key(const char *key, void *val, void *net)
+/** Endpoint visitor (see @file trie.h) */
+static int close_key(trie_val_t *val, void* net)
 {
-	endpoint_array_t *ep_array = val;
+	endpoint_array_t *ep_array = *val;
 	for (int i = 0; i < ep_array->len; ++i) {
 		endpoint_close(net, &ep_array->at[i], true);
 	}
 	return 0;
 }
 
-static int free_key(const char *key, void *val, void *ext)
+static int free_key(trie_val_t *val, void* ext)
 {
-	endpoint_array_t *ep_array = val;
+	endpoint_array_t *ep_array = *val;
 	array_clear(*ep_array);
 	free(ep_array);
 	return kr_ok();
@@ -197,10 +264,21 @@ int kind_unregister(trie_val_t *tv, void *L)
 void network_close_force(struct network *net)
 {
 	if (net != NULL) {
-		map_walk(&net->endpoints, close_key, net);
-		map_walk(&net->endpoints, free_key, 0);
-		map_clear(&net->endpoints);
+		trie_apply(net->endpoints, close_key, net);
+		trie_apply(net->endpoints, free_key, NULL);
+		trie_clear(net->endpoints);
 	}
+}
+
+/** Frees all the `struct net_proxy_data` in the specified trie. */
+void network_proxy_free_addr_data(trie_t* trie)
+{
+	trie_it_t *it;
+	for (it = trie_it_begin(trie); !trie_it_finished(it); trie_it_next(it)) {
+		struct net_proxy_data *data = *trie_it_val(it);
+		free(data);
+	}
+	trie_it_free(it);
 }
 
 void network_deinit(struct network *net)
@@ -209,6 +287,11 @@ void network_deinit(struct network *net)
 		network_close_force(net);
 		trie_apply(net->endpoint_kinds, kind_unregister, the_worker->engine->L);
 		trie_free(net->endpoint_kinds);
+		trie_free(net->endpoints);
+		network_proxy_free_addr_data(net->proxy_addrs4);
+		trie_free(net->proxy_addrs4);
+		network_proxy_free_addr_data(net->proxy_addrs6);
+		trie_free(net->proxy_addrs6);
 
 		tls_credentials_free(net->tls_credentials);
 		tls_client_params_free(net->tls_client_params);
@@ -219,21 +302,44 @@ void network_deinit(struct network *net)
 	}
 }
 
+static ssize_t endpoint_key_create(struct endpoint_key_storage *dst,
+                                   const char *addr_str,
+                                   const struct sockaddr *sa)
+{
+	memset(dst, 0, sizeof(*dst));
+	if (sa) {
+		struct endpoint_key_sockaddr *key = &dst->sa;
+		key->type = ENDPOINT_KEY_SOCKADDR;
+		ssize_t keylen = kr_sockaddr_key(&key->sa_key, sa);
+		if (keylen < 0)
+			return keylen;
+		return sizeof(struct endpoint_key) + keylen;
+	} else {
+		struct endpoint_key_ifname *key = &dst->ifname;
+		key->type = ENDPOINT_KEY_IFNAME;
+		strncpy(key->ifname, addr_str, sizeof(key->ifname) - 1);
+		return sizeof(struct endpoint_key) + strnlen(key->ifname, sizeof(key->ifname));
+	}
+}
+
 /** Fetch or create endpoint array and insert endpoint (shallow memcpy). */
-static int insert_endpoint(struct network *net, const char *addr, struct endpoint *ep)
+static int insert_endpoint(struct network *net, const char *addr_str,
+                           const struct sockaddr *addr, struct endpoint *ep)
 {
 	/* Fetch or insert address into map */
-	endpoint_array_t *ep_array = map_get(&net->endpoints, addr);
-	if (ep_array == NULL) {
+	struct endpoint_key_storage key;
+	ssize_t keylen = endpoint_key_create(&key, addr_str, addr);
+	if (keylen < 0)
+		return keylen;
+	trie_val_t *val = trie_get_ins(net->endpoints, key.bytes, keylen);
+	endpoint_array_t *ep_array;
+	if (*val) {
+		ep_array = *val;
+	} else {
 		ep_array = malloc(sizeof(*ep_array));
-		if (ep_array == NULL) {
-			return kr_error(ENOMEM);
-		}
-		if (map_set(&net->endpoints, addr, ep_array) != 0) {
-			free(ep_array);
-			return kr_error(ENOMEM);
-		}
+		kr_require(ep_array);
 		array_init(*ep_array);
+		*val = ep_array;
 	}
 
 	if (array_reserve(*ep_array, ep_array->len + 1)) {
@@ -250,17 +356,16 @@ static int open_endpoint(struct network *net, const char *addr_str,
 {
 	const bool is_control = ep->flags.kind && strcmp(ep->flags.kind, "control") == 0;
 	const bool is_xdp     = ep->family == AF_XDP;
-	bool ok = is_xdp
-		? sa == NULL && ep->fd == -1 && ep->nic_queue >= 0
-			&& ep->flags.sock_type == SOCK_DGRAM && !ep->flags.tls
-		: (sa != NULL) != (ep->fd != -1);
+	bool ok = (!is_xdp)
+		|| (sa == NULL && ep->fd == -1 && ep->nic_queue >= 0
+			&& ep->flags.sock_type == SOCK_DGRAM && !ep->flags.tls);
 	if (kr_fails_assert(ok))
 		return kr_error(EINVAL);
 	if (ep->handle) {
 		return kr_error(EEXIST);
 	}
 
-	if (sa) {
+	if (sa && ep->fd == -1) {
 		if (sa->sa_family == AF_UNIX) {
 			struct sockaddr_un *sun = (struct sockaddr_un*)sa;
 			char *dirc = strdup(sun->sun_path);
@@ -344,16 +449,24 @@ finish_ret:
  * Beware that there might be multiple matches, though that's not common.
  * The matching isn't really precise in the sense that it might not find
  * and endpoint that would *collide* the passed one. */
-static struct endpoint * endpoint_get(struct network *net, const char *addr,
-					uint16_t port, endpoint_flags_t flags)
+static struct endpoint * endpoint_get(struct network *net,
+                                      const char *addr_str,
+                                      const struct sockaddr *sa,
+                                      endpoint_flags_t flags)
 {
-	endpoint_array_t *ep_array = map_get(&net->endpoints, addr);
-	if (!ep_array) {
+	struct endpoint_key_storage key;
+	ssize_t keylen = endpoint_key_create(&key, addr_str, sa);
+	if (keylen < 0)
 		return NULL;
-	}
+	trie_val_t *val = trie_get_try(net->endpoints, key.bytes, keylen);
+	if (!val)
+		return NULL;
+	endpoint_array_t *ep_array = *val;
+
+	uint16_t port = kr_inaddr_port(sa);
 	for (int i = 0; i < ep_array->len; ++i) {
 		struct endpoint *ep = &ep_array->at[i];
-		if (ep->port == port && endpoint_flags_eq(ep->flags, flags)) {
+		if ((flags.xdp || ep->port == port) && endpoint_flags_eq(ep->flags, flags)) {
 			return ep;
 		}
 	}
@@ -364,11 +477,11 @@ static struct endpoint * endpoint_get(struct network *net, const char *addr,
  *  \note in XDP case addr_str is interface name
  *  \note ownership of ep.flags.* is taken on success. */
 static int create_endpoint(struct network *net, const char *addr_str,
-				struct endpoint *ep, const struct sockaddr *sa)
+                           struct endpoint *ep, const struct sockaddr *sa)
 {
 	int ret = open_endpoint(net, addr_str, ep, sa);
 	if (ret == 0) {
-		ret = insert_endpoint(net, addr_str, ep);
+		ret = insert_endpoint(net, addr_str, sa, ep);
 	}
 	if (ret != 0 && ep->handle) {
 		endpoint_close(net, ep, false);
@@ -429,7 +542,7 @@ int network_listen_fd(struct network *net, int fd, endpoint_flags_t flags)
 
 	/* always create endpoint for supervisor supplied fd
 	 * even if addr+port is not unique */
-	return create_endpoint(net, addr_str, &ep, NULL);
+	return create_endpoint(net, addr_str, &ep, (struct sockaddr *) &ss);
 }
 
 /** Try selecting XDP queue automatically. */
@@ -482,7 +595,7 @@ int network_listen(struct network *net, const char *addr, uint16_t port,
 	}
 	// XDP: if addr failed to parse as address, we assume it's an interface name.
 
-	if (endpoint_get(net, addr, port, flags)) {
+	if (endpoint_get(net, addr, sa, flags)) {
 		return kr_error(EADDRINUSE); // Already listening
 	}
 
@@ -506,13 +619,98 @@ int network_listen(struct network *net, const char *addr, uint16_t port,
 	return ret;
 }
 
-int network_close(struct network *net, const char *addr, int port)
+int network_proxy_allow(struct network *net, const char* addr)
 {
-	endpoint_array_t *ep_array = map_get(&net->endpoints, addr);
-	if (!ep_array) {
-		return kr_error(ENOENT);
+	if (kr_fails_assert(net != NULL && addr != NULL))
+		return kr_error(EINVAL);
+
+	int family = kr_straddr_family(addr);
+	if (family < 0) {
+		kr_log_error(NETWORK, "Wrong address format for proxy_allowed: %s\n",
+				addr);
+		return kr_error(EINVAL);
+	} else if (family == AF_UNIX) {
+		kr_log_error(NETWORK, "Unix sockets not supported for proxy_allowed: %s\n",
+				addr);
+		return kr_error(EINVAL);
 	}
 
+	union kr_in_addr ia;
+	int netmask = kr_straddr_subnet(&ia, addr);
+	if (netmask < 0) {
+		kr_log_error(NETWORK, "Wrong netmask format for proxy_allowed: %s\n", addr);
+		return kr_error(EINVAL);
+	} else if (netmask == 0) {
+		/* Netmask is zero: allow all addresses to use PROXYv2 */
+		switch (family) {
+		case AF_INET:
+			net->proxy_all4 = true;
+			break;
+		case AF_INET6:
+			net->proxy_all6 = true;
+			break;
+		default:
+			kr_assert(false);
+			return kr_error(EINVAL);
+		}
+
+		return kr_ok();
+	}
+
+	size_t addr_length;
+	trie_t *trie;
+	switch (family) {
+	case AF_INET:
+		addr_length = sizeof(ia.ip4);
+		trie = net->proxy_addrs4;
+		break;
+	case AF_INET6:
+		addr_length = sizeof(ia.ip6);
+		trie = net->proxy_addrs6;
+		break;
+	default:
+		kr_assert(false);
+		return kr_error(EINVAL);
+	}
+
+	kr_bitmask((unsigned char *) &ia, addr_length, netmask);
+	trie_val_t *val = trie_get_ins(trie, (char *) &ia, addr_length);
+	if (!val)
+		return kr_error(ENOMEM);
+
+	struct net_proxy_data *data = *val;
+	if (!data) {
+		/* Allocate data if the entry is new in the trie */
+		*val = malloc(sizeof(struct net_proxy_data));
+		data = *val;
+		data->netmask = 0;
+	}
+
+	if (data->netmask == 0) {
+		memcpy(&data->addr, &ia, addr_length);
+		data->netmask = netmask;
+	} else if (data->netmask > netmask) {
+		/* A more relaxed netmask configured - replace it */
+		data->netmask = netmask;
+	}
+
+	return kr_ok();
+}
+
+void network_proxy_reset(struct network *net)
+{
+	net->proxy_all4 = false;
+	network_proxy_free_addr_data(net->proxy_addrs4);
+	trie_clear(net->proxy_addrs4);
+	net->proxy_all6 = false;
+	network_proxy_free_addr_data(net->proxy_addrs6);
+	trie_clear(net->proxy_addrs6);
+}
+
+static int endpoints_close(struct network *net,
+                           struct endpoint_key_storage *key, ssize_t keylen,
+                           endpoint_array_t *ep_array, int port)
+{
 	size_t i = 0;
 	bool matched = false; /*< at least one match */
 	while (i < ep_array->len) {
@@ -530,14 +728,108 @@ int network_close(struct network *net, const char *addr, int port)
 		return kr_error(ENOENT);
 	}
 
+	return kr_ok();
+}
+
+static bool endpoint_key_addr_matches(struct endpoint_key_storage *key_a,
+                                      struct endpoint_key_storage *key_b)
+{
+	if (key_a->type != key_b->type)
+		return false;
+
+	if (key_a->type == ENDPOINT_KEY_IFNAME)
+		return strncmp(key_a->ifname.ifname,
+		               key_b->ifname.ifname,
+		               sizeof(key_a->ifname.ifname)) == 0;
+
+	if (key_a->type == ENDPOINT_KEY_SOCKADDR) {
+		return kr_sockaddr_key_same_addr(
+				key_a->sa.sa_key.bytes, key_b->sa.sa_key.bytes);
+	}
+
+	kr_assert(false);
+	return kr_error(EINVAL);
+}
+
+struct endpoint_key_with_len {
+	struct endpoint_key_storage key;
+	size_t keylen;
+};
+typedef array_t(struct endpoint_key_with_len) endpoint_key_array_t;
+
+struct endpoint_close_wildcard_context {
+	struct network *net;
+	struct endpoint_key_storage *match_key;
+	endpoint_key_array_t del;
+	int ret;
+};
+
+static int endpoints_close_wildcard(const char *s_key, uint32_t keylen, trie_val_t *val, void *baton)
+{
+	struct endpoint_close_wildcard_context *ctx = baton;
+	struct endpoint_key_storage *key = (struct endpoint_key_storage *)s_key;
+
+	if (!endpoint_key_addr_matches(key, ctx->match_key))
+		return kr_ok();
+
+	endpoint_array_t *ep_array = *val;
+	int ret = endpoints_close(ctx->net, key, keylen, ep_array, -1);
+	if (ret)
+		ctx->ret = ret;
+
+	if (ep_array->len == 0) {
+		struct endpoint_key_with_len to_del = {
+			.key = *key,
+			.keylen = keylen
+		};
+		array_push(ctx->del, to_del);
+	}
+
+	return kr_ok();
+}
+
+int network_close(struct network *net, const char *addr_str, int port)
+{
+	auto_free struct sockaddr *addr = kr_straddr_socket(addr_str, port, NULL);
+	struct endpoint_key_storage key;
+	ssize_t keylen = endpoint_key_create(&key, addr_str, addr);
+	if (keylen < 0)
+		return keylen;
+
+	if (port < 0) {
+		struct endpoint_close_wildcard_context ctx = {
+			.net = net,
+			.match_key = &key
+		};
+		array_init(ctx.del);
+		trie_apply_with_key(net->endpoints, endpoints_close_wildcard, &ctx);
+		for (size_t i = 0; i < ctx.del.len; i++) {
+			trie_val_t val;
+			trie_del(net->endpoints,
+			         ctx.del.at[i].key.bytes, ctx.del.at[i].keylen,
+			         &val);
+			if (val) {
+				array_clear(*(endpoint_array_t *) val);
+				free(val);
+			}
+		}
+		return ctx.ret;
+	}
+
+	trie_val_t *val = trie_get_try(net->endpoints, key.bytes, keylen);
+	if (!val)
+		return kr_error(ENOENT);
+	endpoint_array_t *ep_array = *val;
+	int ret = endpoints_close(net, &key, keylen, ep_array, port);
+
 	/* Collapse key if it has no endpoint. */
 	if (ep_array->len == 0) {
 		array_clear(*ep_array);
 		free(ep_array);
-		map_del(&net->endpoints, addr);
+		trie_del(net->endpoints, key.bytes, keylen, NULL);
 	}
 
-	return kr_ok();
+	return ret;
 }
 
 void network_new_hostname(struct network *net, struct engine *engine)
@@ -557,10 +849,10 @@ void network_new_hostname(struct network *net, struct engine *engine)
 }
 
 #ifdef SO_ATTACH_BPF
-static int set_bpf_cb(const char *key, void *val, void *ext)
+static int set_bpf_cb(trie_val_t *val, void *ctx)
 {
-	endpoint_array_t *endpoints = (endpoint_array_t *)val;
-	int *bpffd = (int *)ext;
+	endpoint_array_t *endpoints = *val;
+	int *bpffd = (int *)ctx;
 	if (kr_fails_assert(endpoints && bpffd))
 		return kr_error(EINVAL);
 
@@ -582,7 +874,7 @@ static int set_bpf_cb(const char *key, void *val, void *ext)
 int network_set_bpf(struct network *net, int bpf_fd)
 {
 #ifdef SO_ATTACH_BPF
-	if (map_walk(&net->endpoints, set_bpf_cb, &bpf_fd) != 0) {
+	if (trie_apply(net->endpoints, set_bpf_cb, &bpf_fd) != 0) {
 		/* set_bpf_cb() has returned error. */
 		network_clear_bpf(net);
 		return 0;
@@ -597,9 +889,9 @@ int network_set_bpf(struct network *net, int bpf_fd)
 }
 
 #ifdef SO_DETACH_BPF
-static int clear_bpf_cb(const char *key, void *val, void *ext)
+static int clear_bpf_cb(trie_val_t *val, void *ctx)
 {
-	endpoint_array_t *endpoints = (endpoint_array_t *)val;
+	endpoint_array_t *endpoints = *val;
 	if (kr_fails_assert(endpoints))
 		return kr_error(EINVAL);
 
@@ -623,7 +915,7 @@ static int clear_bpf_cb(const char *key, void *val, void *ext)
 void network_clear_bpf(struct network *net)
 {
 #ifdef SO_DETACH_BPF
-	map_walk(&net->endpoints, clear_bpf_cb, NULL);
+	trie_apply(net->endpoints, clear_bpf_cb, NULL);
 #else
 	kr_log_error(NETWORK, "SO_DETACH_BPF socket option doesn't supported\n");
 	(void)net;

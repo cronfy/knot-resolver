@@ -1,4 +1,21 @@
-Knot Resolver 5.5.0 (2022-mm-dd)
+Knot Resolver 5.5.1 (2022-mm-dd)
+================================
+
+Improvements
+------------
+- daemon/tls: disable TLS resumption via tickets for TLS <= 1.2 (#742, !1295)
+- daemon/http: DoH now responds with proper HTTP codes (#728, !1279)
+- renumber module: allow rewriting subnet to a single IP (!1302)
+
+Bugfixes
+--------
+- modules/dns64: fix incorrect packet writes for cached packets (#727, !1275)
+- xdp: make it work also with libknot 3.1 (#735, !1276)
+- prefill module: fix lockup when starting multiple idle instances (!1285)
+- validator: fix some failing negative NSEC proofs (!1294, #738, #443)
+
+
+Knot Resolver 5.5.0 (2022-03-15)
 ================================
 
 Improvements
@@ -7,6 +24,10 @@ Improvements
 - policy: log policy actions; useful for RPZ debugging (!1239)
 - policy: new action policy.IPTRACE for logging request origin (!1239)
 - prefill module: prepare for ZONEMD, improve performance (!1225)
+- validator: conditionally ignore SHA1 DS, as SHOULD by RFC4509 (!1251)
+- lib/resolve: use EDNS padding for outgoing TLS queries (!1254)
+- support for PROXYv2 protocol (!1238)
+- lib/resolve, policy: new NO_ANSWER flag for not responding to clients (!1257)
 
 Incompatible changes
 --------------------
@@ -15,6 +36,9 @@ Incompatible changes
 Bugfixes
 --------
 - doh2: fix CORS by adding `access-control-allow-origin: *` (!1246)
+- net: fix listen by interface - add interface suffix to link-local IPv6 (!1253)
+- daemon/tls: fix resumption for outgoing TLS (e.g. TLS_FORWARD) (!1261)
+- nameserver selection: fix interaction of timeouts with reboots (#722, !1269)
 
 
 Knot Resolver 5.4.4 (2022-01-05)

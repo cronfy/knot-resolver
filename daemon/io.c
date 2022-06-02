@@ -17,6 +17,7 @@
 #endif
 
 #include "daemon/network.h"
+#include "daemon/proxyv2.h"
 #include "daemon/worker.h"
 #include "daemon/tls.h"
 #include "daemon/http.h"
@@ -68,26 +69,79 @@ static void handle_getbuf(uv_handle_t* handle, size_t suggested_size, uv_buf_t* 
 }
 
 void udp_recv(uv_udp_t *handle, ssize_t nread, const uv_buf_t *buf,
-	const struct sockaddr *addr, unsigned flags)
+	const struct sockaddr *comm_addr, unsigned flags)
 {
 	struct session *s = handle->data;
-	if (session_flags(s)->closing || nread <= 0 || addr->sa_family == AF_UNSPEC)
+	if (session_flags(s)->closing || nread <= 0 || comm_addr->sa_family == AF_UNSPEC)
 		return;
 
 	if (session_flags(s)->outgoing) {
 		const struct sockaddr *peer = session_get_peer(s);
 		if (kr_fails_assert(peer->sa_family != AF_UNSPEC))
 			return;
-		if (kr_sockaddr_cmp(peer, addr) != 0) {
+		if (kr_sockaddr_cmp(peer, comm_addr) != 0) {
 			kr_log_debug(IO, "<= ignoring UDP from unexpected address '%s'\n",
-					kr_straddr(addr));
+					kr_straddr(comm_addr));
 			return;
 		}
 	}
-	ssize_t consumed = session_wirebuf_consume(s, (const uint8_t *)buf->base,
-						   nread);
-	kr_assert(consumed == nread);
-	session_wirebuf_process(s, addr);
+
+	const uint8_t *data = (const uint8_t *)buf->base;
+	ssize_t data_len = nread;
+	const struct sockaddr *src_addr = comm_addr;
+	const struct sockaddr *dst_addr = NULL;
+	struct proxy_result proxy;
+	bool has_proxy = false;
+	if (!session_flags(s)->outgoing && proxy_header_present(data, data_len)) {
+		if (!proxy_allowed(&the_worker->engine->net, comm_addr)) {
+			kr_log_debug(IO, "<= ignoring PROXYv2 UDP from disallowed address '%s'\n",
+					kr_straddr(comm_addr));
+			return;
+		}
+
+		ssize_t trimmed = proxy_process_header(&proxy, s, data, data_len);
+		if (trimmed == KNOT_EMALF) {
+			if (kr_log_is_debug(IO, NULL)) {
+				kr_log_debug(IO, "<= ignoring malformed PROXYv2 UDP "
+						"from address '%s'\n",
+						kr_straddr(comm_addr));
+			}
+			return;
+		} else if (trimmed < 0) {
+			if (kr_log_is_debug(IO, NULL)) {
+				kr_log_debug(IO, "<= error processing PROXYv2 UDP "
+						"from address '%s', ignoring\n",
+						kr_straddr(comm_addr));
+			}
+			return;
+		}
+
+		if (proxy.command == PROXY2_CMD_PROXY && proxy.family != AF_UNSPEC) {
+			has_proxy = true;
+			src_addr = &proxy.src_addr.ip;
+			dst_addr = &proxy.dst_addr.ip;
+
+			if (kr_log_is_debug(IO, NULL)) {
+				kr_log_debug(IO, "<= UDP query from '%s'\n",
+						kr_straddr(src_addr));
+				kr_log_debug(IO, "<= proxied through '%s'\n",
+						kr_straddr(comm_addr));
+			}
+		}
+		data = session_wirebuf_get_free_start(s);
+		data_len = nread - trimmed;
+	}
+
+	ssize_t consumed = session_wirebuf_consume(s, data, data_len);
+	kr_assert(consumed == data_len);
+
+	struct io_comm_data comm = {
+		.src_addr = src_addr,
+		.comm_addr = comm_addr,
+		.dst_addr = dst_addr,
+		.proxy = (has_proxy) ? &proxy : NULL
+	};
+	session_wirebuf_process(s, &comm);
 	session_wirebuf_discard(s);
 	mp_flush(the_worker->pkt_pool.ctx);
 }
@@ -129,29 +183,42 @@ int io_bind(const struct sockaddr *addr, int type, const endpoint_flags_t *flags
 
 	int yes = 1;
 	if (addr->sa_family == AF_INET || addr->sa_family == AF_INET6) {
-		if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)))
+		if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes))) {
+			close(fd);
 			return kr_error(errno);
+		}
 
 #ifdef SO_REUSEPORT_LB
-		if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT_LB, &yes, sizeof(yes)))
+		if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT_LB, &yes, sizeof(yes))) {
+			close(fd);
 			return kr_error(errno);
+		}
 #elif defined(SO_REUSEPORT) && defined(__linux__) /* different meaning on (Free)BSD */
-		if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(yes)))
+		if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(yes))) {
+			close(fd);
 			return kr_error(errno);
+		}
 #endif
 
 #ifdef IPV6_V6ONLY
 		if (addr->sa_family == AF_INET6
-		    && setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &yes, sizeof(yes)))
+		    && setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &yes, sizeof(yes))) {
+			close(fd);
 			return kr_error(errno);
+		}
 #endif
 		if (flags != NULL && flags->freebind) {
 			int optlevel;
 			int optname;
 			int ret = family_to_freebind_option(addr->sa_family, &optlevel, &optname);
-			if (ret) return kr_error(ret);
-			if (setsockopt(fd, optlevel, optname, &yes, sizeof(yes)))
+			if (ret) {
+				close(fd);
+				return kr_error(ret);
+			}
+			if (setsockopt(fd, optlevel, optname, &yes, sizeof(yes))) {
+				close(fd);
 				return kr_error(errno);
+			}
 		}
 
 		/* Linux 3.15 has IP_PMTUDISC_OMIT which makes sockets
@@ -172,8 +239,10 @@ int io_bind(const struct sockaddr *addr, int type, const endpoint_flags_t *flags
 #endif
 	}
 
-	if (bind(fd, addr, kr_sockaddr_len(addr)))
+	if (bind(fd, addr, kr_sockaddr_len(addr))) {
+		close(fd);
 		return kr_error(errno);
+	}
 
 	return fd;
 }
@@ -292,17 +361,68 @@ static void tcp_recv(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf)
 		return;
 	}
 
-	ssize_t consumed = 0;
 	const uint8_t *data = (const uint8_t *)buf->base;
 	ssize_t data_len = nread;
+	const struct sockaddr *src_addr = session_get_peer(s);
+	const struct sockaddr *dst_addr = NULL;
+	if (!session_flags(s)->outgoing && !session_flags(s)->no_proxy &&
+			proxy_header_present(data, data_len)) {
+		if (!proxy_allowed(&the_worker->engine->net, src_addr)) {
+			if (kr_log_is_debug(IO, NULL)) {
+				kr_log_debug(IO, "<= connection to '%s': PROXYv2 not allowed "
+						"for this peer, close\n",
+						kr_straddr(src_addr));
+			}
+			worker_end_tcp(s);
+			return;
+		}
+
+		struct proxy_result *proxy = session_proxy_create(s);
+		ssize_t trimmed = proxy_process_header(proxy, s, data, data_len);
+		if (trimmed < 0) {
+			if (kr_log_is_debug(IO, NULL)) {
+				if (trimmed == KNOT_EMALF) {
+					kr_log_debug(IO, "<= connection to '%s': "
+							"malformed PROXYv2 header, close\n",
+							kr_straddr(src_addr));
+				} else {
+					kr_log_debug(IO, "<= connection to '%s': "
+							"error processing PROXYv2 header, close\n",
+							kr_straddr(src_addr));
+				}
+			}
+			worker_end_tcp(s);
+			return;
+		} else if (trimmed == 0) {
+			return;
+		}
+
+		if (proxy->command != PROXY2_CMD_LOCAL && proxy->family != AF_UNSPEC) {
+			src_addr = &proxy->src_addr.ip;
+			dst_addr = &proxy->dst_addr.ip;
+
+			if (kr_log_is_debug(IO, NULL)) {
+				kr_log_debug(IO, "<= TCP stream from '%s'\n",
+						kr_straddr(src_addr));
+				kr_log_debug(IO, "<= proxied through '%s'\n",
+						kr_straddr(session_get_peer(s)));
+			}
+		}
+
+		data = session_wirebuf_get_free_start(s);
+		data_len = nread - trimmed;
+	}
+
+	session_flags(s)->no_proxy = true;
+
+	ssize_t consumed = 0;
 	if (session_flags(s)->has_tls) {
 		/* buf->base points to start of the tls receive buffer.
 		   Decode data free space in session wire buffer. */
-		consumed = tls_process_input_data(s, (const uint8_t *)buf->base, nread);
+		consumed = tls_process_input_data(s, data, data_len);
 		if (consumed < 0) {
 			if (kr_log_is_debug(IO, NULL)) {
-				struct sockaddr *peer = session_get_peer(s);
-				char *peer_str = kr_straddr(peer);
+				char *peer_str = kr_straddr(src_addr);
 				kr_log_debug(IO, "=> connection to '%s': "
 					       "error processing TLS data, close\n",
 					       peer_str ? peer_str : "");
@@ -316,19 +436,21 @@ static void tcp_recv(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf)
 		data_len = consumed;
 	}
 #if ENABLE_DOH2
+	int streaming = 1;
 	if (session_flags(s)->has_http) {
-		consumed = http_process_input_data(s, data, data_len);
-		if (consumed < 0) {
+		streaming = http_process_input_data(s, data, data_len,
+				&consumed);
+		if (streaming < 0) {
 			if (kr_log_is_debug(IO, NULL)) {
-				struct sockaddr *peer = session_get_peer(s);
-				char *peer_str = kr_straddr(peer);
+				char *peer_str = kr_straddr(src_addr);
 				kr_log_debug(IO, "=> connection to '%s': "
 				       "error processing HTTP data, close\n",
 				       peer_str ? peer_str : "");
 			}
 			worker_end_tcp(s);
 			return;
-		} else if (consumed == 0) {
+		}
+		if (consumed == 0) {
 			return;
 		}
 		data = session_wirebuf_get_free_start(s);
@@ -341,13 +463,28 @@ static void tcp_recv(uv_stream_t *handle, ssize_t nread, const uv_buf_t *buf)
 	consumed = session_wirebuf_consume(s, data, data_len);
 	kr_assert(consumed == data_len);
 
-	int ret = session_wirebuf_process(s, session_get_peer(s));
+	struct io_comm_data comm = {
+		.src_addr = src_addr,
+		.comm_addr = session_get_peer(s),
+		.dst_addr = dst_addr,
+		.proxy = session_proxy_get(s)
+	};
+	int ret = session_wirebuf_process(s, &comm);
 	if (ret < 0) {
 		/* An error has occurred, close the session. */
 		worker_end_tcp(s);
 	}
 	session_wirebuf_compress(s);
 	mp_flush(the_worker->pkt_pool.ctx);
+#if ENABLE_DOH2
+	if (session_flags(s)->has_http && streaming == 0 && ret == 0) {
+		ret = http_send_status(s, HTTP_STATUS_BAD_REQUEST);
+		if (ret) {
+			/* An error has occurred, close the session. */
+			worker_end_tcp(s);
+		}
+	}
+#endif
 }
 
 #if ENABLE_DOH2
@@ -611,11 +748,11 @@ void io_tty_process_input(uv_stream_t *stream, ssize_t nread, const uv_buf_t *bu
 	char *cmd, *cmd_next = NULL;
 	bool incomplete_cmd = false;
 
-	if (!(stream && commands && nread > 0)) {
+	if (!commands || nread <= 0) {
 		goto finish;
 	}
-	/* Execute */
 
+	/* Execute */
 	if (commands[nread - 1] != '\n') {
 		incomplete_cmd = true;
 	}
@@ -749,24 +886,30 @@ struct io_stream_data *io_tty_alloc_data() {
 
 void io_tty_accept(uv_stream_t *master, int status)
 {
-	struct io_stream_data *data = io_tty_alloc_data();
 	/* We can't use any allocations after mp_start() and it's easier anyway. */
 	uv_pipe_t *client = malloc(sizeof(*client));
+	if (!client)
+		return;
+
+	struct io_stream_data *data = io_tty_alloc_data();
+	if (!data) {
+		free(client);
+		return;
+	}
 	client->data = data;
 
 	struct args *args = the_args;
-	if (client && client->data) {
-		 uv_pipe_init(master->loop, client, 0);
-		 if (uv_accept(master, (uv_stream_t *)client) != 0) {
-			mp_delete(data->pool->ctx);
-			return;
-		 }
-		 uv_read_start((uv_stream_t *)client, io_tty_alloc, io_tty_process_input);
-		 /* Write command line */
-		 if (!args->quiet) {
-			uv_buf_t buf = { "> ", 2 };
-			uv_try_write((uv_stream_t *)client, &buf, 1);
-		 }
+	uv_pipe_init(master->loop, client, 0);
+	if (uv_accept(master, (uv_stream_t *)client) != 0) {
+		mp_delete(data->pool->ctx);
+		return;
+	}
+	uv_read_start((uv_stream_t *)client, io_tty_alloc, io_tty_process_input);
+
+	/* Write command line */
+	if (!args->quiet) {
+		uv_buf_t buf = { "> ", 2 };
+		uv_try_write((uv_stream_t *)client, &buf, 1);
 	}
 }
 
@@ -827,9 +970,12 @@ static void xdp_rx(uv_poll_t* handle, int status, int events)
 		if (kpkt == NULL) {
 			ret = kr_error(ENOMEM);
 		} else {
-			ret = worker_submit(xhd->session,
-					(const struct sockaddr *)&msg->ip_from,
-					(const struct sockaddr *)&msg->ip_to,
+			struct io_comm_data comm = {
+				.src_addr = (const struct sockaddr *)&msg->ip_from,
+				.comm_addr = (const struct sockaddr *)&msg->ip_from,
+				.dst_addr = (const struct sockaddr *)&msg->ip_to
+			};
+			ret = worker_submit(xhd->session, &comm,
 					msg->eth_from, msg->eth_to, kpkt);
 		}
 		if (ret)
